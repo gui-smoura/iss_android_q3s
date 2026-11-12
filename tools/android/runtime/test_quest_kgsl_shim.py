@@ -75,6 +75,15 @@ struct KgslGpumemFreeId {
     unsigned int id;
     unsigned int pad;
 };
+struct KgslGpumemGetInfo {
+    uint64_t gpuaddr;
+    unsigned int id;
+    unsigned int flags;
+    size_t size;
+    size_t mmapsize;
+    uint64_t useraddr;
+    size_t pad[4];
+};
 struct KgslGpuobjAlloc {
     uint64_t size;
     uint64_t flags;
@@ -132,6 +141,8 @@ constexpr unsigned long kIoctlKgslGpumemAllocId =
     _IOWR(kKgslIocType, 0x34, KgslGpumemAllocId);
 constexpr unsigned long kIoctlKgslGpumemFreeId =
     _IOWR(kKgslIocType, 0x35, KgslGpumemFreeId);
+constexpr unsigned long kIoctlKgslGpumemGetInfo =
+    _IOWR(kKgslIocType, 0x36, KgslGpumemGetInfo);
 constexpr unsigned long kIoctlKgslGpuobjAlloc =
     _IOWR(kKgslIocType, 0x45, KgslGpuobjAlloc);
 constexpr unsigned long kIoctlKgslGpuobjFree =
@@ -144,16 +155,21 @@ constexpr unsigned long kIoctlKgslGpuCommand =
 bool g_fail_gpuobj_info = false;
 unsigned int g_last_freed_id = 0;
 unsigned int g_retired_on_gpu = 0;
+uint64_t g_last_gpuobj_alloc_flags = 0;
+uint64_t g_last_gpuobj_alloc_va_len = 0;
 
 int MockQuestKernelIoctl(int /*fd*/, unsigned long request, void* arg) {
     if (request == kIoctlKgslGpumemAllocId ||
         request == kIoctlKgslGpumemFreeId ||
+        request == kIoctlKgslGpumemGetInfo ||
         request == kIoctlKgslCmdstreamReadtimestampCtxtid) {
         errno = EACCES;
         return -1;
     }
     if (request == kIoctlKgslGpuobjAlloc) {
         auto* a = static_cast<KgslGpuobjAlloc*>(arg);
+        g_last_gpuobj_alloc_flags = a->flags;
+        g_last_gpuobj_alloc_va_len = a->va_len;
         a->id = 42;
         a->mmapsize = a->size + 4096;
         return 0;
@@ -165,9 +181,11 @@ int MockQuestKernelIoctl(int /*fd*/, unsigned long request, void* arg) {
         }
         auto* info = static_cast<KgslGpuobjInfo*>(arg);
         assert(info->id == 42);
+        // Simulate kernel returning GPUOBJ_INFO with bit 28 set if not stripped by shim:
         info->gpuaddr = 0x700012340000ULL;
-        info->flags = 0x1000;
+        info->flags = 0x10001000ULL;
         info->size = 65536;
+        info->va_addr = 0x7f0000000000ULL;
         return 0;
     }
     if (request == kIoctlKgslGpuobjFree) {
@@ -203,16 +221,31 @@ int ReplacementIoctlForGotTest(int fd, unsigned long request, ...) {
 int main(int argc, char** argv) {
     assert(argc == 2);
 
-    // 1. Test GPUMEM_ALLOC_ID -> GPUOBJ_ALLOC + GPUOBJ_INFO fallback.
+    // 1. Test GPUMEM_ALLOC_ID -> GPUOBJ_ALLOC + GPUOBJ_INFO fallback and stripping of
+    // KGSL_MEMFLAGS_USE_CPU_MAP (0x10000000) so Turnip's is_memory_type_supported(USE_CPU_MAP)
+    // probe returns false on 64-bit processes and BOs keep valid GPU IOVAs.
     KgslGpumemAllocId alloc_req{};
     alloc_req.size = 65536;
-    alloc_req.flags = 0x1000;
+    alloc_req.flags = 0x10001000U;
     int rc = iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, 99, kIoctlKgslGpumemAllocId, &alloc_req);
     assert(rc == 0);
     assert(alloc_req.id == 42);
+    assert(g_last_gpuobj_alloc_flags == 0x1000ULL);
+    assert(g_last_gpuobj_alloc_va_len == 65536ULL);
+    assert((alloc_req.flags & 0x10000000U) == 0);
     assert(alloc_req.gpuaddr == 0x700012340000ULL);
     assert(alloc_req.size == 65536);
     assert(alloc_req.mmapsize == 65536 + 4096);
+
+    // 1b. Test GPUMEM_GET_INFO -> GPUOBJ_INFO fallback.
+    KgslGpumemGetInfo get_info_req{};
+    get_info_req.id = 42;
+    rc = iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, 99, kIoctlKgslGpumemGetInfo, &get_info_req);
+    assert(rc == 0);
+    assert(get_info_req.gpuaddr == 0x700012340000ULL);
+    assert((get_info_req.flags & 0x10000000U) == 0);
+    assert(get_info_req.size == 65536);
+    assert(get_info_req.useraddr == 0x7f0000000000ULL);
 
     // 2. Test GPUMEM_FREE_ID -> GPUOBJ_FREE fallback.
     KgslGpumemFreeId free_req{};
@@ -299,37 +332,26 @@ int main(int argc, char** argv) {
             )
             self.assertEqual(0, run_res.returncode, run_res.stderr)
 
-    def test_lds_atomic_minmax_cas_lowering_is_wired(self):
+    def test_qualcomm_compute_opt_disable_and_lds_workgroup_clamp_are_wired(self):
         profile_h = (ROOT / "port/gpu/shadps4/shader_recompiler/profile.h").read_text()
         self.assertIn("bool needs_shared_atomic_minmax_cas{};", profile_h)
 
-        cache_cpp = (
-            ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp"
+        compute_cpp = (
+            ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_compute_pipeline.cpp"
         ).read_text()
-        self.assertIn(".needs_shared_atomic_minmax_cas =", cache_cpp)
-        self.assertIn("eQualcommProprietary", cache_cpp)
+        self.assertIn("vk::DriverId::eQualcommProprietary", compute_cpp)
+        self.assertIn("vk::PipelineCreateFlagBits::eDisableOptimization", compute_cpp)
+        self.assertIn("ISS_QCOM_CS_OPT", compute_cpp)
+
+        spirv_ctx_cpp = (
+            ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/spirv_emit_context.cpp"
+        ).read_text()
+        self.assertIn("std::max(1u, Common::DivCeil(shared_memory_size, element_size))", spirv_ctx_cpp)
 
         ser_cpp = (
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
         ).read_text()
-        self.assertIn("ShaderBinaryVersion = 11u;", ser_cpp)
-
-        atomic_cpp = (
-            ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp"
-        ).read_text()
-        self.assertIn("SharedAtomicMinMaxCasImpl", atomic_cpp)
-        self.assertIn("ctx.OpAtomicCompareExchange", atomic_cpp)
-        for fn in (
-            "EmitSharedAtomicUMax32",
-            "EmitSharedAtomicUMax64",
-            "EmitSharedAtomicSMax32",
-            "EmitSharedAtomicSMax64",
-            "EmitSharedAtomicUMin32",
-            "EmitSharedAtomicUMin64",
-            "EmitSharedAtomicSMin32",
-            "EmitSharedAtomicSMin64",
-        ):
-            self.assertIn(fn, atomic_cpp)
+        self.assertIn("ShaderBinaryVersion = 12u;", ser_cpp)
 
 
 if __name__ == "__main__":

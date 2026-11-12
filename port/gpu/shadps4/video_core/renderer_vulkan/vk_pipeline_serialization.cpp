@@ -37,7 +37,7 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 11u; // LDS atomic min/max CAS lowering for Adreno/QGL
+static constexpr u32 ShaderBinaryVersion = 12u; // Clamp non-zero LDS workgroup array & Qualcomm CS opt fix
 static constexpr u32 ShaderMetaVersion = 9u; // tlg: LDS barrier scope per guest wave
 static constexpr u32 PipelineKeyVersion = 5u; // tlg: Info layout (ImageResource::needs_native)
 } // namespace Serialization

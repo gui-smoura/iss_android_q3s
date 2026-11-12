@@ -99,17 +99,26 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     BuildDescriptorTemplate({bindings.data(), bindings.size()});
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
+    static const bool force_disable_qcom_cs_opt = [] {
+        const char* env = std::getenv("ISS_QCOM_CS_OPT");
+        return !(env && env[0] == '1');
+    }();
+    const bool disable_cs_opt =
+        force_disable_qcom_cs_opt && instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
+
     // Runs on the compiler threads too: it only uses what stays fixed after construction and
     // the layout, which the destructor keeps alive until the build is done. Returns no pipeline
     // when one may only come from the driver's cache and it isn't there.
-    const auto create = [&instance, module, layout = *pipeline_layout,
-                         debug_str](vk::PipelineCache cache,
-                                    vk::PipelineCreateFlags flags) -> vk::UniquePipeline {
+    const auto create = [&instance, module, layout = *pipeline_layout, debug_str,
+                         disable_cs_opt](vk::PipelineCache cache,
+                                         vk::PipelineCreateFlags flags) -> vk::UniquePipeline {
+        const auto effective_flags =
+            disable_cs_opt ? (flags | vk::PipelineCreateFlagBits::eDisableOptimization) : flags;
         const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
             .requiredSubgroupSize = 64,
         };
         const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
-            .flags = flags,
+            .flags = effective_flags,
             .stage{
                 .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
                 .stage = vk::ShaderStageFlagBits::eCompute,
@@ -125,7 +134,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             created = device.createComputePipelineUnique(cache, compute_pipeline_ci);
         }
         if (created.result == vk::Result::ePipelineCompileRequired &&
-            (flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired)) {
+            (effective_flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired)) {
             return {};
         }
         if (created.result == vk::Result::eSuccess) {
@@ -154,45 +163,53 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             RecordWaveSizes();
             return;
         }
-        auto state = std::make_shared<Build>();
-        const auto caches = builder->caches;
         const bool deferred_bind = scheduler.RecordsOnThread();
-        // With the Vulkan recording thread, the dispatch binds the pipeline there (Handle()
-        // waits for it), so the GPU thread goes on and the next new pipelines are built
-        // alongside: a burst costs about one build instead of their sum. NVIDIA builds one
-        // without optimizations about as slowly, so the optimized one is built directly.
-        // Otherwise one is built here without optimizations, several times quicker on some
-        // drivers, and the optimized one replaces it (SwapInOptimized).
-        const bool queued = builder->compiler->Submit(
-            [state, create, caches, deferred_bind, debug_str] {
-                const auto start = std::chrono::steady_clock::now();
-                auto built = create(*caches[AsyncCompiler::WorkerIndex()], {});
-                LOG_INFO(Render_Vulkan, "tlg: compute pipeline {} built on a compiler thread in "
-                         "{:.1f} ms{}", debug_str,
-                         std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - start).count(),
-                         deferred_bind ? "" : " (replaces the unoptimized one)");
-                {
-                    std::scoped_lock lock{state->mutex};
-                    if (deferred_bind) {
-                        state->handle.store(static_cast<VkPipeline>(*built), std::memory_order_release);
+        // When disable_cs_opt is active and we do not defer binding to the recording thread,
+        // both the immediate pipeline and the background replacement would be compiled with
+        // eDisableOptimization, so skip queuing a redundant background build.
+        if (!disable_cs_opt || deferred_bind) {
+            auto state = std::make_shared<Build>();
+            const auto caches = builder->caches;
+            // With the Vulkan recording thread, the dispatch binds the pipeline there (Handle()
+            // waits for it), so the GPU thread goes on and the next new pipelines are built
+            // alongside: a burst costs about one build instead of their sum. NVIDIA builds one
+            // without optimizations about as slowly, so the optimized one is built directly.
+            // Otherwise one is built here without optimizations, several times quicker on some
+            // drivers, and the optimized one replaces it (SwapInOptimized).
+            const bool queued = builder->compiler->Submit(
+                [state, create, caches, deferred_bind, debug_str] {
+                    const auto start = std::chrono::steady_clock::now();
+                    auto built = create(*caches[AsyncCompiler::WorkerIndex()], {});
+                    LOG_INFO(Render_Vulkan, "tlg: compute pipeline {} built on a compiler thread in "
+                             "{:.1f} ms{}", debug_str,
+                             std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start).count(),
+                             deferred_bind ? "" : " (replaces the unoptimized one)");
+                    {
+                        std::scoped_lock lock{state->mutex};
+                        if (deferred_bind) {
+                            state->handle.store(static_cast<VkPipeline>(*built),
+                                                std::memory_order_release);
+                        }
+                        state->result = std::move(built);
+                        state->done.store(true, std::memory_order_release);
                     }
-                    state->result = std::move(built);
-                    state->done.store(true, std::memory_order_release);
+                    state->cv.notify_all();
+                },
+                deferred_bind);
+            if (queued) {
+                build = std::move(state);
+                if (!deferred_bind) {
+                    pipeline =
+                        create(pipeline_cache, vk::PipelineCreateFlagBits::eDisableOptimization);
+                    build->handle.store(static_cast<VkPipeline>(*pipeline),
+                                        std::memory_order_release);
+                    optimized_pending = true;
                 }
-                state->cv.notify_all();
-            },
-            deferred_bind);
-        if (queued) {
-            build = std::move(state);
-            if (!deferred_bind) {
-                pipeline = create(pipeline_cache, vk::PipelineCreateFlagBits::eDisableOptimization);
-                build->handle.store(static_cast<VkPipeline>(*pipeline), std::memory_order_release);
-                optimized_pending = true;
+                return;
             }
-            return;
         }
-        // The compiler queue is full: built here, as before.
+        // The compiler queue is full (or disable_cs_opt is active without deferred_bind): built here.
     }
     pipeline = create(pipeline_cache, {});
     RecordWaveSizes();

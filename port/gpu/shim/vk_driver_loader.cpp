@@ -68,6 +68,16 @@ struct KgslGpumemFreeId {
     unsigned int pad;
 };
 
+struct KgslGpumemGetInfo {
+    uint64_t gpuaddr;
+    unsigned int id;
+    unsigned int flags;
+    size_t size;
+    size_t mmapsize;
+    uint64_t useraddr;
+    size_t pad[4];
+};
+
 struct KgslGpuobjAlloc {
     uint64_t size;
     uint64_t flags;
@@ -143,9 +153,22 @@ struct KgslGpuAuxCommand {
     unsigned int timestamp;
 };
 
+struct KgslSparseCommand {
+    uint64_t flags;
+    uint64_t sparsemem;
+    unsigned int size;
+    unsigned int numcmds;
+    uint64_t synclist;
+    unsigned int syncsize;
+    unsigned int numsyncs;
+    unsigned int context_id;
+    unsigned int timestamp;
+};
+
 #if INTPTR_MAX == INT64_MAX
 static_assert(sizeof(KgslGpumemAllocId) == 48, "kgsl_gpumem_alloc_id layout");
 static_assert(sizeof(KgslGpumemFreeId) == 8, "kgsl_gpumem_free_id layout");
+static_assert(sizeof(KgslGpumemGetInfo) == 72, "kgsl_gpumem_get_info layout");
 static_assert(sizeof(KgslGpuobjAlloc) == 48, "kgsl_gpuobj_alloc layout");
 static_assert(sizeof(KgslGpuobjFree) == 32, "kgsl_gpuobj_free layout");
 static_assert(sizeof(KgslGpuobjInfo) == 48, "kgsl_gpuobj_info layout");
@@ -155,6 +178,7 @@ static_assert(sizeof(KgslDeviceWaittimestampCtxtid) == 12,
               "kgsl_device_waittimestamp_ctxtid layout");
 static_assert(sizeof(KgslGpuCommand) == 64, "kgsl_gpu_command layout");
 static_assert(sizeof(KgslGpuAuxCommand) == 48, "kgsl_gpu_aux_command layout");
+static_assert(sizeof(KgslSparseCommand) == 48, "kgsl_sparse_command layout");
 #endif
 
 constexpr unsigned long kIoctlKgslDeviceWaittimestampCtxtid =
@@ -169,6 +193,8 @@ constexpr unsigned long kIoctlKgslGpumemAllocId =
     _IOWR(kKgslIocType, 0x34, KgslGpumemAllocId);
 constexpr unsigned long kIoctlKgslGpumemFreeId =
     _IOWR(kKgslIocType, 0x35, KgslGpumemFreeId);
+constexpr unsigned long kIoctlKgslGpumemGetInfo =
+    _IOWR(kKgslIocType, 0x36, KgslGpumemGetInfo);
 constexpr unsigned long kIoctlKgslGpuobjAlloc =
     _IOWR(kKgslIocType, 0x45, KgslGpuobjAlloc);
 constexpr unsigned long kIoctlKgslGpuobjFree =
@@ -179,6 +205,15 @@ constexpr unsigned long kIoctlKgslGpuCommand =
     _IOWR(kKgslIocType, 0x4a, KgslGpuCommand);
 constexpr unsigned long kIoctlKgslGpuAuxCommand =
     _IOWR(kKgslIocType, 0x4c, KgslGpuAuxCommand);
+constexpr unsigned long kIoctlKgslSparseCommand =
+    _IOWR(kKgslIocType, 0x57, KgslSparseCommand);
+
+// On 64-bit processes, KGSL_MEMFLAGS_USE_CPU_MAP (0x10000000) is invalid and the kernel's
+// IOCTL_KGSL_GPUMEM_ALLOC_ID strips it from returned flags so Turnip's is_memory_type_supported()
+// probe returns false (use_4gb_va = false). IOCTL_KGSL_GPUOBJ_ALLOC does NOT strip that bit and
+// instead skips allocating a GPU IOVA (gpuaddr = 0), causing Turnip to overwrite bo->iova with
+// the 64-bit CPU mmap address and fail on the very first vkQueueSubmit with VK_ERROR_DEVICE_LOST.
+constexpr uint64_t kKgslMemflagsUseCpuMap = 0x10000000ULL;
 
 constexpr unsigned int kKgslTimestampQueued = 1;
 constexpr unsigned int kKgslTimestampRetired = 3;
@@ -199,6 +234,7 @@ std::mutex g_kgsl_mutex;
 TrackedKgslContext g_kgsl_contexts[kMaxTrackedContexts]{};
 std::atomic<bool> g_logged_gpuobj_fallback{false};
 std::atomic<bool> g_logged_timestamp_fallback{false};
+std::atomic<int> g_logged_kgsl_errors{0};
 
 bool TimestampGreater(unsigned int a, unsigned int b) {
     return static_cast<int32_t>(a - b) > 0;
@@ -272,7 +308,8 @@ int FallbackGpumemAllocId(IssRealIoctlFn real_ioctl, int fd, KgslGpumemAllocId* 
     }
     KgslGpuobjAlloc alloc{};
     alloc.size = req->size;
-    alloc.flags = req->flags;
+    alloc.flags = static_cast<uint64_t>(req->flags) & ~kKgslMemflagsUseCpuMap;
+    alloc.va_len = req->size;
     if (real_ioctl(fd, kIoctlKgslGpuobjAlloc, &alloc) < 0) {
         return -1;
     }
@@ -287,13 +324,16 @@ int FallbackGpumemAllocId(IssRealIoctlFn real_ioctl, int fd, KgslGpumemAllocId* 
         return -1;
     }
     req->id = alloc.id;
-    req->flags = static_cast<unsigned int>(info.flags);
+    req->flags = static_cast<unsigned int>(info.flags & ~kKgslMemflagsUseCpuMap);
     req->size = static_cast<size_t>(info.size);
     req->mmapsize = static_cast<size_t>(alloc.mmapsize ? alloc.mmapsize : info.size);
     req->gpuaddr = info.gpuaddr;
     if (!g_logged_gpuobj_fallback.exchange(true)) {
         std::fprintf(stderr,
-                     "Vulkan: Quest KGSL compatibility active (GPUMEM_ALLOC_ID -> GPUOBJ_ALLOC)\n");
+                     "Vulkan: Quest KGSL compatibility active (GPUMEM_ALLOC_ID -> GPUOBJ_ALLOC, "
+                     "first id=%u size=%zu flags=0x%x gpuaddr=0x%llx)\n",
+                     req->id, req->size, req->flags,
+                     static_cast<unsigned long long>(req->gpuaddr));
     }
     return 0;
 }
@@ -306,6 +346,25 @@ int FallbackGpumemFreeId(IssRealIoctlFn real_ioctl, int fd, KgslGpumemFreeId* re
     KgslGpuobjFree free_req{};
     free_req.id = req->id;
     return real_ioctl(fd, kIoctlKgslGpuobjFree, &free_req);
+}
+
+int FallbackGpumemGetInfo(IssRealIoctlFn real_ioctl, int fd, KgslGpumemGetInfo* req) {
+    if (!req) {
+        errno = EFAULT;
+        return -1;
+    }
+    KgslGpuobjInfo info{};
+    info.id = req->id;
+    if (real_ioctl(fd, kIoctlKgslGpuobjInfo, &info) < 0) {
+        return -1;
+    }
+    req->gpuaddr = info.gpuaddr;
+    req->id = info.id;
+    req->flags = static_cast<unsigned int>(info.flags & ~kKgslMemflagsUseCpuMap);
+    req->size = static_cast<size_t>(info.size);
+    req->mmapsize = static_cast<size_t>(info.size);
+    req->useraddr = info.va_addr;
+    return 0;
 }
 
 int FallbackReadtimestampCtxtid(IssRealIoctlFn real_ioctl, int fd,
@@ -787,6 +846,9 @@ iss_quest_kgsl_ioctl_with_fn(IssRealIoctlFn real_ioctl, int fd, unsigned long re
         } else if (request == kIoctlKgslGpuAuxCommand && arg) {
             const auto* aux = static_cast<const KgslGpuAuxCommand*>(arg);
             RecordKgslSubmission(aux->context_id, aux->timestamp);
+        } else if (request == kIoctlKgslSparseCommand && arg) {
+            const auto* sparse = static_cast<const KgslSparseCommand*>(arg);
+            RecordKgslSubmission(sparse->context_id, sparse->timestamp);
         } else if (request == kIoctlKgslDrawctxtCreate && arg) {
             const auto* create_req = static_cast<const KgslDrawctxtCreate*>(arg);
             std::lock_guard<std::mutex> lock(g_kgsl_mutex);
@@ -799,22 +861,36 @@ iss_quest_kgsl_ioctl_with_fn(IssRealIoctlFn real_ioctl, int fd, unsigned long re
     }
 
     const int saved_errno = errno;
-    if (saved_errno != EACCES && saved_errno != EPERM) {
-        return ret;
+    if (saved_errno == EACCES || saved_errno == EPERM) {
+        if (request == kIoctlKgslGpumemAllocId) {
+            return FallbackGpumemAllocId(real_ioctl, fd, static_cast<KgslGpumemAllocId*>(arg));
+        }
+        if (request == kIoctlKgslGpumemFreeId) {
+            return FallbackGpumemFreeId(real_ioctl, fd, static_cast<KgslGpumemFreeId*>(arg));
+        }
+        if (request == kIoctlKgslGpumemGetInfo) {
+            return FallbackGpumemGetInfo(real_ioctl, fd, static_cast<KgslGpumemGetInfo*>(arg));
+        }
+        if (request == kIoctlKgslCmdstreamReadtimestampCtxtid) {
+            const auto* read_req = static_cast<const KgslCmdstreamReadtimestampCtxtid*>(arg);
+            if (read_req &&
+                (read_req->type == kKgslTimestampQueued ||
+                 read_req->type == kKgslTimestampRetired)) {
+                return FallbackReadtimestampCtxtid(
+                    real_ioctl, fd, static_cast<KgslCmdstreamReadtimestampCtxtid*>(arg));
+            }
+        }
     }
 
-    if (request == kIoctlKgslGpumemAllocId) {
-        return FallbackGpumemAllocId(real_ioctl, fd, static_cast<KgslGpumemAllocId*>(arg));
-    }
-    if (request == kIoctlKgslGpumemFreeId) {
-        return FallbackGpumemFreeId(real_ioctl, fd, static_cast<KgslGpumemFreeId*>(arg));
-    }
-    if (request == kIoctlKgslCmdstreamReadtimestampCtxtid) {
-        const auto* read_req = static_cast<const KgslCmdstreamReadtimestampCtxtid*>(arg);
-        if (read_req &&
-            (read_req->type == kKgslTimestampQueued || read_req->type == kKgslTimestampRetired)) {
-            return FallbackReadtimestampCtxtid(
-                real_ioctl, fd, static_cast<KgslCmdstreamReadtimestampCtxtid*>(arg));
+    if (_IOC_TYPE(request) == kKgslIocType && saved_errno != EAGAIN && saved_errno != EINTR &&
+        saved_errno != ETIMEDOUT) {
+        const int logged = g_logged_kgsl_errors.fetch_add(1, std::memory_order_relaxed);
+        if (logged < 8) {
+            std::fprintf(stderr,
+                         "Vulkan: KGSL ioctl 0x%lx (nr=0x%02lx, size=%lu) failed with errno=%d (%s)\n",
+                         request, static_cast<unsigned long>(_IOC_NR(request)),
+                         static_cast<unsigned long>(_IOC_SIZE(request)), saved_errno,
+                         std::strerror(saved_errno));
         }
     }
 
