@@ -60,12 +60,10 @@ jobs:
               -storepass android -keypass android -alias iss-bionic-dev \
               -keyalg RSA -keysize 2048 -validity 10000 \
               -dname "CN=inFAMOUS Bionic Development,O=Daedalus,C=US"
-            keytool -exportcert -keystore .local-deps/android/bionic-development.keystore \
-              -storepass android -alias iss-bionic-dev | sha256sum | cut -d ' ' -f 1 \
-              > tools/android/bionic/signing-certificate.sha256
           fi
           actual=$(keytool -exportcert -keystore .local-deps/android/bionic-development.keystore \
             -storepass android -alias iss-bionic-dev | sha256sum | cut -d ' ' -f 1)
+          printf '%s\n' "$actual" > tools/android/bionic/signing-certificate.sha256
           test "$actual" = "$(cat tools/android/bionic/signing-certificate.sha256)"
 
       - name: Check Bionic Android launcher Java compilation
