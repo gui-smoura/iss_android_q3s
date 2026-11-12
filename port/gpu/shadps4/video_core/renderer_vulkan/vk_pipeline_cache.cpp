@@ -641,12 +641,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .fragment_contraction_policy = Shader::Backend::SPIRV::FragmentContractionEnabled(),
         .needs_shared_atomic_minmax_cas = [&] {
             if (const char* env = std::getenv("TLG_LDS_ATOMIC_CAS")) {
-                return env[0] == '1';
+                return env[0] != '0';
             }
             if (const char* env = std::getenv("ISS_LDS_ATOMIC_CAS")) {
-                return env[0] == '1';
+                return env[0] != '0';
             }
-            return false;
+#ifdef __ANDROID__
+            return true;
+#else
+            return instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
+#endif
         }(),
     };
     // tlg: the recompiler switches (ISS_ names arrive as TLG_), one line each on stdout (the run

@@ -130,6 +130,62 @@ Id SharedAtomicMinMaxCasU64(EmitContext& ctx, Id offset, Id value,
     return SharedAtomicMinMaxCasImpl(ctx, ctx.U64, pointer, value, compare_func);
 }
 
+/// Lowers general Workgroup (LDS) integer atomic RMW operations (IAdd, ISub, And, Or, Xor, Inc,
+/// Dec) to an OpAtomicLoad + binary op + OpAtomicCompareExchange structured loop. Qualcomm's
+/// proprietary compiler (/vendor/lib64/libllvm-qgl.so+0x988494 on Horizon OS / Quest 3S) also
+/// segfaults with signal 11 on @llvm.qgpu.atomic.add.oob.p3i32.i32 (e.g. DS_ADD_RTN_U32 with 0)
+/// and other 2-operand __local* RMW intrinsics, whereas OpAtomicLoad + OpAtomicCompareExchange
+/// compiles cleanly.
+Id SharedAtomicBinOpCasImpl(EmitContext& ctx, Id type, Id pointer, Id value,
+                            Id (Sirit::Module::*bin_op)(Id, Id, Id)) {
+    const auto [scope, semantics]{AtomicArgs(ctx)};
+    const Id loop_header{ctx.OpLabel()};
+    const Id loop_body{ctx.OpLabel()};
+    const Id continue_block{ctx.OpLabel()};
+    const Id merge_block{ctx.OpLabel()};
+
+    ctx.OpBranch(loop_header);
+    ctx.AddLabel(loop_header);
+    ctx.OpLoopMerge(merge_block, continue_block, spv::LoopControlMask::MaskNone);
+    ctx.OpBranch(loop_body);
+
+    ctx.AddLabel(loop_body);
+    const Id old_val{ctx.OpAtomicLoad(type, pointer, scope, semantics)};
+    const Id new_val{(ctx.*bin_op)(type, old_val, value)};
+    const Id prev_val{ctx.OpAtomicCompareExchange(type, pointer, scope, semantics, semantics,
+                                                  new_val, old_val)};
+    const Id done{ctx.OpIEqual(ctx.U1[1], prev_val, old_val)};
+    ctx.OpBranch(continue_block);
+
+    ctx.AddLabel(continue_block);
+    const Id retry{ctx.OpLogicalNot(ctx.U1[1], done)};
+    ctx.OpBranchConditional(retry, loop_header, merge_block);
+
+    ctx.AddLabel(merge_block);
+    return prev_val;
+}
+
+Id SharedAtomicBinOpCasU32(EmitContext& ctx, Id offset, Id value,
+                           Id (Sirit::Module::*bin_op)(Id, Id, Id),
+                           bool zero_is_noop = false) {
+    const Id shift_id{ctx.ConstU32(2U)};
+    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
+    const Id pointer{ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index)};
+    if (zero_is_noop && value == ctx.u32_zero_value) {
+        const auto [scope, semantics]{AtomicArgs(ctx)};
+        return ctx.OpAtomicLoad(ctx.U32[1], pointer, scope, semantics);
+    }
+    return SharedAtomicBinOpCasImpl(ctx, ctx.U32[1], pointer, value, bin_op);
+}
+
+Id SharedAtomicBinOpCasU64(EmitContext& ctx, Id offset, Id value,
+                           Id (Sirit::Module::*bin_op)(Id, Id, Id)) {
+    const Id shift_id{ctx.ConstU32(3U)};
+    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
+    const Id pointer{ctx.EmitSharedMemoryAccess(ctx.shared_u64, ctx.shared_memory_u64, index)};
+    return SharedAtomicBinOpCasImpl(ctx, ctx.U64, pointer, value, bin_op);
+}
+
 template <bool is_float = false>
 Id BufferAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                    Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
@@ -239,10 +295,16 @@ Id FloatAtomicMinMax(EmitContext& ctx, Id value, NegativeAtomic&& negative_atomi
 } // Anonymous namespace
 
 Id EmitSharedAtomicIAdd32(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpIAdd, true);
+    }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicIAdd);
 }
 
 Id EmitSharedAtomicIAdd64(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU64(ctx, offset, value, &Sirit::Module::OpIAdd);
+    }
     return SharedAtomicU64(ctx, offset, value, &Sirit::Module::OpAtomicIAdd);
 }
 
@@ -304,34 +366,58 @@ Id EmitSharedAtomicSMin64(EmitContext& ctx, Id offset, Id value) {
 
 
 Id EmitSharedAtomicAnd32(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpBitwiseAnd);
+    }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicAnd);
 }
 
 Id EmitSharedAtomicAnd64(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU64(ctx, offset, value, &Sirit::Module::OpBitwiseAnd);
+    }
     return SharedAtomicU64(ctx, offset, value, &Sirit::Module::OpAtomicAnd);
 }
 
 Id EmitSharedAtomicOr32(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpBitwiseOr, true);
+    }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicOr);
 }
 
 Id EmitSharedAtomicOr64(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU64(ctx, offset, value, &Sirit::Module::OpBitwiseOr);
+    }
     return SharedAtomicU64(ctx, offset, value, &Sirit::Module::OpAtomicOr);
 }
 
 Id EmitSharedAtomicXor32(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpBitwiseXor, true);
+    }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicXor);
 }
 
 Id EmitSharedAtomicXor64(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU64(ctx, offset, value, &Sirit::Module::OpBitwiseXor);
+    }
     return SharedAtomicU64(ctx, offset, value, &Sirit::Module::OpAtomicXor);
 }
 
 Id EmitSharedAtomicISub32(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpISub, true);
+    }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicISub);
 }
 
 Id EmitSharedAtomicISub64(EmitContext& ctx, Id offset, Id value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU64(ctx, offset, value, &Sirit::Module::OpISub);
+    }
     return SharedAtomicU64(ctx, offset, value, &Sirit::Module::OpAtomicISub);
 }
 
@@ -344,18 +430,32 @@ Id EmitSharedAtomicCmpSwap64(EmitContext& ctx, Id offset, Id value, Id cmp_value
 }
 
 Id EmitSharedAtomicInc32(EmitContext& ctx, Id offset) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU32(ctx, offset, ctx.ConstU32(1U), &Sirit::Module::OpIAdd);
+    }
     return SharedAtomicU32IncDec(ctx, offset, &Sirit::Module::OpAtomicIIncrement);
 }
 
 Id EmitSharedAtomicInc64(EmitContext& ctx, Id offset) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU64(ctx, offset, ctx.Constant(ctx.U64, 1ULL),
+                                       &Sirit::Module::OpIAdd);
+    }
     return SharedAtomicU64IncDec(ctx, offset, &Sirit::Module::OpAtomicIIncrement);
 }
 
 Id EmitSharedAtomicDec32(EmitContext& ctx, Id offset) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU32(ctx, offset, ctx.ConstU32(1U), &Sirit::Module::OpISub);
+    }
     return SharedAtomicU32IncDec(ctx, offset, &Sirit::Module::OpAtomicIDecrement);
 }
 
 Id EmitSharedAtomicDec64(EmitContext& ctx, Id offset) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        return SharedAtomicBinOpCasU64(ctx, offset, ctx.Constant(ctx.U64, 1ULL),
+                                       &Sirit::Module::OpISub);
+    }
     return SharedAtomicU64IncDec(ctx, offset, &Sirit::Module::OpAtomicIDecrement);
 }
 

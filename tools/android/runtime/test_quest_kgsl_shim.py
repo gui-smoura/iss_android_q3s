@@ -136,7 +136,7 @@ struct KgslGpuCommand {
 constexpr unsigned long kIoctlKgslDeviceWaittimestampCtxtid =
     _IOW(kKgslIocType, 0x07, KgslDeviceWaittimestampCtxtid);
 constexpr unsigned long kIoctlKgslCmdstreamReadtimestampCtxtid =
-    _IOR(kKgslIocType, 0x16, KgslCmdstreamReadtimestampCtxtid);
+    _IOWR(kKgslIocType, 0x16, KgslCmdstreamReadtimestampCtxtid);
 constexpr unsigned long kIoctlKgslGpumemAllocId =
     _IOWR(kKgslIocType, 0x34, KgslGpumemAllocId);
 constexpr unsigned long kIoctlKgslGpumemFreeId =
@@ -221,6 +221,9 @@ int ReplacementIoctlForGotTest(int fd, unsigned long request, ...) {
 int main(int argc, char** argv) {
     assert(argc == 2);
 
+    // Verify that kIoctlKgslCmdstreamReadtimestampCtxtid matches Turnip's 0xc00c0916 (_IOWR).
+    assert(kIoctlKgslCmdstreamReadtimestampCtxtid == 0xc00c0916UL);
+
     // 1. Test GPUMEM_ALLOC_ID -> GPUOBJ_ALLOC + GPUOBJ_INFO fallback and stripping of
     // KGSL_MEMFLAGS_USE_CPU_MAP (0x10000000) so Turnip's is_memory_type_supported(USE_CPU_MAP)
     // probe returns false on 64-bit processes and BOs keep valid GPU IOVAs.
@@ -262,7 +265,7 @@ int main(int argc, char** argv) {
     assert(g_last_freed_id == 42);
     g_fail_gpuobj_info = false;
 
-    // 4. Test CMDSTREAM_READTIMESTAMP_CTXTID fallback using GPU_COMMAND tracking + WAITTIMESTAMP.
+    // 4. Test CMDSTREAM_READTIMESTAMP_CTXTID (0xc00c0916) fallback using GPU_COMMAND tracking + WAITTIMESTAMP.
     for (unsigned int ts : {10u, 11u, 12u}) {
         KgslGpuCommand cmd{};
         cmd.context_id = 7;
@@ -336,6 +339,44 @@ int main(int argc, char** argv) {
         profile_h = (ROOT / "port/gpu/shadps4/shader_recompiler/profile.h").read_text()
         self.assertIn("bool needs_shared_atomic_minmax_cas{};", profile_h)
 
+        cache_cpp = (
+            ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp"
+        ).read_text()
+        self.assertIn(".needs_shared_atomic_minmax_cas =", cache_cpp)
+        self.assertIn("return true;", cache_cpp)
+
+        atomic_cpp = (
+            ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp"
+        ).read_text()
+        self.assertIn("SharedAtomicMinMaxCasImpl", atomic_cpp)
+        self.assertIn("SharedAtomicBinOpCasImpl", atomic_cpp)
+        self.assertIn("ctx.OpAtomicCompareExchange", atomic_cpp)
+        for fn in (
+            "EmitSharedAtomicIAdd32",
+            "EmitSharedAtomicIAdd64",
+            "EmitSharedAtomicISub32",
+            "EmitSharedAtomicISub64",
+            "EmitSharedAtomicUMax32",
+            "EmitSharedAtomicUMax64",
+            "EmitSharedAtomicSMax32",
+            "EmitSharedAtomicSMax64",
+            "EmitSharedAtomicUMin32",
+            "EmitSharedAtomicUMin64",
+            "EmitSharedAtomicSMin32",
+            "EmitSharedAtomicSMin64",
+            "EmitSharedAtomicAnd32",
+            "EmitSharedAtomicAnd64",
+            "EmitSharedAtomicOr32",
+            "EmitSharedAtomicOr64",
+            "EmitSharedAtomicXor32",
+            "EmitSharedAtomicXor64",
+            "EmitSharedAtomicInc32",
+            "EmitSharedAtomicInc64",
+            "EmitSharedAtomicDec32",
+            "EmitSharedAtomicDec64",
+        ):
+            self.assertIn(fn, atomic_cpp)
+
         compute_cpp = (
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_compute_pipeline.cpp"
         ).read_text()
@@ -351,7 +392,7 @@ int main(int argc, char** argv) {
         ser_cpp = (
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
         ).read_text()
-        self.assertIn("ShaderBinaryVersion = 12u;", ser_cpp)
+        self.assertIn("ShaderBinaryVersion = 13u;", ser_cpp)
 
 
 if __name__ == "__main__":

@@ -188,7 +188,7 @@ constexpr unsigned long kIoctlKgslDrawctxtCreate =
 constexpr unsigned long kIoctlKgslDrawctxtDestroy =
     _IOW(kKgslIocType, 0x14, KgslDrawctxtDestroy);
 constexpr unsigned long kIoctlKgslCmdstreamReadtimestampCtxtid =
-    _IOR(kKgslIocType, 0x16, KgslCmdstreamReadtimestampCtxtid);
+    _IOWR(kKgslIocType, 0x16, KgslCmdstreamReadtimestampCtxtid);
 constexpr unsigned long kIoctlKgslGpumemAllocId =
     _IOWR(kKgslIocType, 0x34, KgslGpumemAllocId);
 constexpr unsigned long kIoctlKgslGpumemFreeId =
@@ -207,6 +207,11 @@ constexpr unsigned long kIoctlKgslGpuAuxCommand =
     _IOWR(kKgslIocType, 0x4c, KgslGpuAuxCommand);
 constexpr unsigned long kIoctlKgslSparseCommand =
     _IOWR(kKgslIocType, 0x57, KgslSparseCommand);
+
+constexpr bool IsKgslIoctlNr(unsigned long request, unsigned long nr, size_t expected_size) {
+    return _IOC_TYPE(request) == kKgslIocType && _IOC_NR(request) == nr &&
+           _IOC_SIZE(request) == expected_size;
+}
 
 // On 64-bit processes, KGSL_MEMFLAGS_USE_CPU_MAP (0x10000000) is invalid and the kernel's
 // IOCTL_KGSL_GPUMEM_ALLOC_ID strips it from returned flags so Turnip's is_memory_type_supported()
@@ -387,7 +392,7 @@ int FallbackReadtimestampCtxtid(IssRealIoctlFn real_ioctl, int fd,
         TrackedKgslContext* ctx = FindOrCreateKgslContextLocked(req->context_id);
         latest_queued = ctx->latest_queued;
         latest_retired = ctx->latest_retired;
-        if (req->type == kKgslTimestampQueued) {
+        if (req->type != kKgslTimestampRetired) {
             req->timestamp = latest_queued;
             errno = 0;
             return 0;
@@ -414,6 +419,12 @@ int FallbackReadtimestampCtxtid(IssRealIoctlFn real_ioctl, int fd,
         if (real_ioctl(fd, kIoctlKgslDeviceWaittimestampCtxtid, &wait_req) == 0) {
             retired = pending_copy[i];
             completed_count = i + 1;
+        } else if (errno == EACCES || errno == EPERM) {
+            // If WAITTIMESTAMP_CTXTID is also denied by SELinux, retire up to latest_queued so
+            // Turnip never stalls or returns VK_ERROR_DEVICE_LOST.
+            retired = latest_queued;
+            completed_count = pending_count;
+            break;
         } else {
             break;
         }
@@ -840,20 +851,20 @@ iss_quest_kgsl_ioctl_with_fn(IssRealIoctlFn real_ioctl, int fd, unsigned long re
     }
     const int ret = real_ioctl(fd, request, arg);
     if (ret == 0) {
-        if (request == kIoctlKgslGpuCommand && arg) {
+        if (IsKgslIoctlNr(request, 0x4a, sizeof(KgslGpuCommand)) && arg) {
             const auto* cmd = static_cast<const KgslGpuCommand*>(arg);
             RecordKgslSubmission(cmd->context_id, cmd->timestamp);
-        } else if (request == kIoctlKgslGpuAuxCommand && arg) {
+        } else if (IsKgslIoctlNr(request, 0x4c, sizeof(KgslGpuAuxCommand)) && arg) {
             const auto* aux = static_cast<const KgslGpuAuxCommand*>(arg);
             RecordKgslSubmission(aux->context_id, aux->timestamp);
-        } else if (request == kIoctlKgslSparseCommand && arg) {
+        } else if (IsKgslIoctlNr(request, 0x57, sizeof(KgslSparseCommand)) && arg) {
             const auto* sparse = static_cast<const KgslSparseCommand*>(arg);
             RecordKgslSubmission(sparse->context_id, sparse->timestamp);
-        } else if (request == kIoctlKgslDrawctxtCreate && arg) {
+        } else if (IsKgslIoctlNr(request, 0x13, sizeof(KgslDrawctxtCreate)) && arg) {
             const auto* create_req = static_cast<const KgslDrawctxtCreate*>(arg);
             std::lock_guard<std::mutex> lock(g_kgsl_mutex);
             FindOrCreateKgslContextLocked(create_req->drawctxt_id);
-        } else if (request == kIoctlKgslDrawctxtDestroy && arg) {
+        } else if (IsKgslIoctlNr(request, 0x14, sizeof(KgslDrawctxtDestroy)) && arg) {
             const auto* destroy_req = static_cast<const KgslDrawctxtDestroy*>(arg);
             DestroyKgslContext(destroy_req->drawctxt_id);
         }
@@ -862,28 +873,27 @@ iss_quest_kgsl_ioctl_with_fn(IssRealIoctlFn real_ioctl, int fd, unsigned long re
 
     const int saved_errno = errno;
     if (saved_errno == EACCES || saved_errno == EPERM) {
-        if (request == kIoctlKgslGpumemAllocId) {
+        if (IsKgslIoctlNr(request, 0x34, sizeof(KgslGpumemAllocId))) {
             return FallbackGpumemAllocId(real_ioctl, fd, static_cast<KgslGpumemAllocId*>(arg));
         }
-        if (request == kIoctlKgslGpumemFreeId) {
+        if (IsKgslIoctlNr(request, 0x35, sizeof(KgslGpumemFreeId))) {
             return FallbackGpumemFreeId(real_ioctl, fd, static_cast<KgslGpumemFreeId*>(arg));
         }
-        if (request == kIoctlKgslGpumemGetInfo) {
+        if (IsKgslIoctlNr(request, 0x36, sizeof(KgslGpumemGetInfo))) {
             return FallbackGpumemGetInfo(real_ioctl, fd, static_cast<KgslGpumemGetInfo*>(arg));
         }
-        if (request == kIoctlKgslCmdstreamReadtimestampCtxtid) {
-            const auto* read_req = static_cast<const KgslCmdstreamReadtimestampCtxtid*>(arg);
-            if (read_req &&
-                (read_req->type == kKgslTimestampQueued ||
-                 read_req->type == kKgslTimestampRetired)) {
-                return FallbackReadtimestampCtxtid(
-                    real_ioctl, fd, static_cast<KgslCmdstreamReadtimestampCtxtid*>(arg));
-            }
+        if (IsKgslIoctlNr(request, 0x16, sizeof(KgslCmdstreamReadtimestampCtxtid))) {
+            return FallbackReadtimestampCtxtid(
+                real_ioctl, fd, static_cast<KgslCmdstreamReadtimestampCtxtid*>(arg));
         }
     }
 
-    if (_IOC_TYPE(request) == kKgslIocType && saved_errno != EAGAIN && saved_errno != EINTR &&
-        saved_errno != ETIMEDOUT) {
+    // Ignore benign ENODEV on IOCTL_KGSL_DEVICE_GETPROPERTY (nr=0x02) when Turnip probes optional
+    // kernel properties.
+    const bool benign_getprop_enodev =
+        (_IOC_NR(request) == 0x02 && (saved_errno == ENODEV || saved_errno == EINVAL));
+    if (_IOC_TYPE(request) == kKgslIocType && !benign_getprop_enodev && saved_errno != EAGAIN &&
+        saved_errno != EINTR && saved_errno != ETIMEDOUT) {
         const int logged = g_logged_kgsl_errors.fetch_add(1, std::memory_order_relaxed);
         if (logged < 8) {
             std::fprintf(stderr,
