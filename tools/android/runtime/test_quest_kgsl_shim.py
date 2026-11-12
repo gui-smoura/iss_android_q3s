@@ -394,6 +394,73 @@ int main(int argc, char** argv) {
         ).read_text()
         self.assertIn("ShaderBinaryVersion = 13u;", ser_cpp)
 
+        if shutil.which("c++"):
+            with tempfile.TemporaryDirectory() as temp:
+                p = Path(temp)
+                stub_dir = p / "shader_recompiler/backend/spirv"
+                stub_dir.mkdir(parents=True)
+                (stub_dir / "spirv_emit_context.h").write_text(r"""
+#pragma once
+#include <cstdint>
+#include <sirit/sirit.h>
+using u32 = std::uint32_t;
+using u64 = std::uint64_t;
+#define UNREACHABLE_MSG(...) __builtin_trap()
+namespace Shader::IR { class Inst; }
+namespace Shader::Backend::SPIRV {
+using Sirit::Id;
+struct ProfileStub {
+    bool needs_shared_atomic_minmax_cas{};
+    bool supports_buffer_fp32_atomic_min_max{};
+    bool supports_image_fp32_atomic_min_max{};
+};
+class EmitContext : public Sirit::Module {
+public:
+    enum class PointerType { U32, F32, U64 };
+    enum class PointerSize { B32, B64 };
+    struct BufferStub {
+        Id Offset(PointerSize) const { return {}; }
+        std::pair<Id, Id> Alias(PointerType) const { return {}; }
+    };
+    struct ImageStub { Id id{}; };
+    Id ConstU32(u32) { return {}; }
+    Id EmitSharedMemoryAccess(Id, Id, Id) { return {}; }
+    Id u32_zero_value{};
+    Id true_value{};
+    Id U32[5]{};
+    Id F32[5]{};
+    Id U1[5]{};
+    Id U64{};
+    Id shared_u32{}, shared_memory_u32{};
+    Id shared_u64{}, shared_memory_u64{};
+    Id image_u32{}, image_f32{};
+    BufferStub buffers[16]{};
+    ImageStub images[16]{};
+    ProfileStub profile{};
+};
+} // namespace Shader::Backend::SPIRV
+""")
+                (stub_dir / "emit_spirv_instructions.h").write_text(
+                    (ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_instructions.h")
+                    .read_text()
+                    .replace(
+                        '#include "common/types.h"',
+                        "#include <cstdint>\nusing u32 = std::uint32_t;\nusing u64 = std::uint64_t;\n",
+                    )
+                    .replace('#include "shader_recompiler/ir/value.h"', "namespace Shader::IR { class Inst; }")
+                )
+                chk = subprocess.run(
+                    [
+                        "c++", "-std=c++20", "-fsyntax-only",
+                        "-I", str(p),
+                        "-I", str(ROOT / "port/gpu/third_party/sirit/include"),
+                        "-I", str(ROOT / "port/gpu/third_party/sirit/externals/SPIRV-Headers/include"),
+                        str(ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp"),
+                    ],
+                    capture_output=True, text=True
+                )
+                self.assertEqual(0, chk.returncode, chk.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

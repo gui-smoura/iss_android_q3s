@@ -166,15 +166,10 @@ Id SharedAtomicBinOpCasImpl(EmitContext& ctx, Id type, Id pointer, Id value,
 }
 
 Id SharedAtomicBinOpCasU32(EmitContext& ctx, Id offset, Id value,
-                           Id (Sirit::Module::*bin_op)(Id, Id, Id),
-                           bool zero_is_noop = false) {
+                           Id (Sirit::Module::*bin_op)(Id, Id, Id)) {
     const Id shift_id{ctx.ConstU32(2U)};
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
     const Id pointer{ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index)};
-    if (zero_is_noop && value == ctx.u32_zero_value) {
-        const auto [scope, semantics]{AtomicArgs(ctx)};
-        return ctx.OpAtomicLoad(ctx.U32[1], pointer, scope, semantics);
-    }
     return SharedAtomicBinOpCasImpl(ctx, ctx.U32[1], pointer, value, bin_op);
 }
 
@@ -296,7 +291,7 @@ Id FloatAtomicMinMax(EmitContext& ctx, Id value, NegativeAtomic&& negative_atomi
 
 Id EmitSharedAtomicIAdd32(EmitContext& ctx, Id offset, Id value) {
     if (ctx.profile.needs_shared_atomic_minmax_cas) {
-        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpIAdd, true);
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpIAdd);
     }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicIAdd);
 }
@@ -381,7 +376,7 @@ Id EmitSharedAtomicAnd64(EmitContext& ctx, Id offset, Id value) {
 
 Id EmitSharedAtomicOr32(EmitContext& ctx, Id offset, Id value) {
     if (ctx.profile.needs_shared_atomic_minmax_cas) {
-        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpBitwiseOr, true);
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpBitwiseOr);
     }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicOr);
 }
@@ -395,7 +390,7 @@ Id EmitSharedAtomicOr64(EmitContext& ctx, Id offset, Id value) {
 
 Id EmitSharedAtomicXor32(EmitContext& ctx, Id offset, Id value) {
     if (ctx.profile.needs_shared_atomic_minmax_cas) {
-        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpBitwiseXor, true);
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpBitwiseXor);
     }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicXor);
 }
@@ -409,7 +404,7 @@ Id EmitSharedAtomicXor64(EmitContext& ctx, Id offset, Id value) {
 
 Id EmitSharedAtomicISub32(EmitContext& ctx, Id offset, Id value) {
     if (ctx.profile.needs_shared_atomic_minmax_cas) {
-        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpISub, true);
+        return SharedAtomicBinOpCasU32(ctx, offset, value, &Sirit::Module::OpISub);
     }
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicISub);
 }
