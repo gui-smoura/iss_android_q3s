@@ -134,7 +134,7 @@ Swapchain::~Swapchain() {
     Destroy();
     if (staging_cmd_pool) {
         instance.GetDevice().destroyCommandPool(staging_cmd_pool);
-        staging_cmd_pool = {};
+        staging_cmd_pool = nullptr;
     }
     client.Disconnect();
 }
