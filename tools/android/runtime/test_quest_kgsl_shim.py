@@ -1,0 +1,336 @@
+"""Tests for Meta Quest 3 / 3S (Horizon OS) KGSL ioctl compatibility shim and LDS atomic CAS lowering."""
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+class QuestKgslShimTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("c++"), "C++ compiler unavailable")
+    def test_kgsl_gpuobj_and_timestamp_fallbacks_and_elf_got_hook(self):
+        loader_cpp = ROOT / "port/gpu/shim/vk_driver_loader.cpp"
+        loader_h = ROOT / "port/gpu/shim/vk_driver_loader.h"
+
+        mock_driver_src = r"""
+#include <sys/ioctl.h>
+#include <cstddef>
+#include <cstdint>
+
+struct KgslGpumemAllocId {
+
+    unsigned int id;
+    unsigned int flags;
+    size_t size;
+    size_t mmapsize;
+    uint64_t gpuaddr;
+    uint64_t pad[2];
+};
+
+static constexpr unsigned int kKgslIocType = 0x09;
+static constexpr unsigned long kIoctlKgslGpumemAllocId =
+    _IOWR(kKgslIocType, 0x34, KgslGpumemAllocId);
+
+extern "C" __attribute__((visibility("default"))) int
+mock_driver_alloc_bo(int fd, uint64_t* out_gpuaddr, unsigned int* out_id) {
+    KgslGpumemAllocId req{};
+    req.size = 65536;
+    req.flags = 0x1000;
+    int ret = ioctl(fd, kIoctlKgslGpumemAllocId, &req);
+    if (ret == 0) {
+        *out_gpuaddr = req.gpuaddr;
+        *out_id = req.id;
+    }
+    return ret;
+}
+"""
+
+        harness_src = r"""
+#include "vk_driver_loader.h"
+
+#include <cassert>
+#include <cerrno>
+#include <cstdarg>
+#include <cstdint>
+#include <cstring>
+#include <dlfcn.h>
+#include <initializer_list>
+#include <sys/ioctl.h>
+
+
+namespace {
+constexpr unsigned int kKgslIocType = 0x09;
+
+struct KgslGpumemAllocId {
+    unsigned int id;
+    unsigned int flags;
+    size_t size;
+    size_t mmapsize;
+    uint64_t gpuaddr;
+    uint64_t pad[2];
+};
+struct KgslGpumemFreeId {
+    unsigned int id;
+    unsigned int pad;
+};
+struct KgslGpuobjAlloc {
+    uint64_t size;
+    uint64_t flags;
+    uint64_t va_len;
+    uint64_t mmapsize;
+    unsigned int id;
+    unsigned int metadata_len;
+    uint64_t metadata;
+};
+struct KgslGpuobjFree {
+    uint64_t flags;
+    uint64_t priv;
+    unsigned int id;
+    unsigned int type;
+    unsigned int len;
+};
+struct KgslGpuobjInfo {
+    uint64_t gpuaddr;
+    uint64_t flags;
+    uint64_t size;
+    uint64_t va_len;
+    uint64_t va_addr;
+    unsigned int id;
+};
+struct KgslCmdstreamReadtimestampCtxtid {
+    unsigned int context_id;
+    unsigned int type;
+    unsigned int timestamp;
+};
+struct KgslDeviceWaittimestampCtxtid {
+    unsigned int context_id;
+    unsigned int timestamp;
+    unsigned int timeout;
+};
+struct KgslGpuCommand {
+    uint64_t flags;
+    uint64_t cmdlist;
+    unsigned int cmdsize;
+    unsigned int numcmds;
+    uint64_t objlist;
+    unsigned int objsize;
+    unsigned int numobjs;
+    uint64_t synclist;
+    unsigned int syncsize;
+    unsigned int numsyncs;
+    unsigned int context_id;
+    unsigned int timestamp;
+};
+
+constexpr unsigned long kIoctlKgslDeviceWaittimestampCtxtid =
+    _IOW(kKgslIocType, 0x07, KgslDeviceWaittimestampCtxtid);
+constexpr unsigned long kIoctlKgslCmdstreamReadtimestampCtxtid =
+    _IOR(kKgslIocType, 0x16, KgslCmdstreamReadtimestampCtxtid);
+constexpr unsigned long kIoctlKgslGpumemAllocId =
+    _IOWR(kKgslIocType, 0x34, KgslGpumemAllocId);
+constexpr unsigned long kIoctlKgslGpumemFreeId =
+    _IOWR(kKgslIocType, 0x35, KgslGpumemFreeId);
+constexpr unsigned long kIoctlKgslGpuobjAlloc =
+    _IOWR(kKgslIocType, 0x45, KgslGpuobjAlloc);
+constexpr unsigned long kIoctlKgslGpuobjFree =
+    _IOW(kKgslIocType, 0x46, KgslGpuobjFree);
+constexpr unsigned long kIoctlKgslGpuobjInfo =
+    _IOWR(kKgslIocType, 0x47, KgslGpuobjInfo);
+constexpr unsigned long kIoctlKgslGpuCommand =
+    _IOWR(kKgslIocType, 0x4a, KgslGpuCommand);
+
+bool g_fail_gpuobj_info = false;
+unsigned int g_last_freed_id = 0;
+unsigned int g_retired_on_gpu = 0;
+
+int MockQuestKernelIoctl(int /*fd*/, unsigned long request, void* arg) {
+    if (request == kIoctlKgslGpumemAllocId ||
+        request == kIoctlKgslGpumemFreeId ||
+        request == kIoctlKgslCmdstreamReadtimestampCtxtid) {
+        errno = EACCES;
+        return -1;
+    }
+    if (request == kIoctlKgslGpuobjAlloc) {
+        auto* a = static_cast<KgslGpuobjAlloc*>(arg);
+        a->id = 42;
+        a->mmapsize = a->size + 4096;
+        return 0;
+    }
+    if (request == kIoctlKgslGpuobjInfo) {
+        if (g_fail_gpuobj_info) {
+            errno = EINVAL;
+            return -1;
+        }
+        auto* info = static_cast<KgslGpuobjInfo*>(arg);
+        assert(info->id == 42);
+        info->gpuaddr = 0x700012340000ULL;
+        info->flags = 0x1000;
+        info->size = 65536;
+        return 0;
+    }
+    if (request == kIoctlKgslGpuobjFree) {
+        auto* f = static_cast<KgslGpuobjFree*>(arg);
+        g_last_freed_id = f->id;
+        return 0;
+    }
+    if (request == kIoctlKgslGpuCommand) {
+        return 0;
+    }
+    if (request == kIoctlKgslDeviceWaittimestampCtxtid) {
+        auto* w = static_cast<KgslDeviceWaittimestampCtxtid*>(arg);
+        if (w->timestamp <= g_retired_on_gpu) {
+            return 0;
+        }
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    errno = ENOTTY;
+    return -1;
+}
+
+int ReplacementIoctlForGotTest(int fd, unsigned long request, ...) {
+    va_list ap;
+    va_start(ap, request);
+    void* arg = va_arg(ap, void*);
+    va_end(ap);
+    return iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, fd, request, arg);
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    assert(argc == 2);
+
+    // 1. Test GPUMEM_ALLOC_ID -> GPUOBJ_ALLOC + GPUOBJ_INFO fallback.
+    KgslGpumemAllocId alloc_req{};
+    alloc_req.size = 65536;
+    alloc_req.flags = 0x1000;
+    int rc = iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, 99, kIoctlKgslGpumemAllocId, &alloc_req);
+    assert(rc == 0);
+    assert(alloc_req.id == 42);
+    assert(alloc_req.gpuaddr == 0x700012340000ULL);
+    assert(alloc_req.size == 65536);
+    assert(alloc_req.mmapsize == 65536 + 4096);
+
+    // 2. Test GPUMEM_FREE_ID -> GPUOBJ_FREE fallback.
+    KgslGpumemFreeId free_req{};
+    free_req.id = 42;
+    rc = iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, 99, kIoctlKgslGpumemFreeId, &free_req);
+    assert(rc == 0);
+    assert(g_last_freed_id == 42);
+
+    // 3. Test cleanup when GPUOBJ_INFO fails after GPUOBJ_ALLOC succeeds.
+    g_last_freed_id = 0;
+    g_fail_gpuobj_info = true;
+    rc = iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, 99, kIoctlKgslGpumemAllocId, &alloc_req);
+    assert(rc == -1 && errno == EINVAL);
+    assert(g_last_freed_id == 42);
+    g_fail_gpuobj_info = false;
+
+    // 4. Test CMDSTREAM_READTIMESTAMP_CTXTID fallback using GPU_COMMAND tracking + WAITTIMESTAMP.
+    for (unsigned int ts : {10u, 11u, 12u}) {
+        KgslGpuCommand cmd{};
+        cmd.context_id = 7;
+        cmd.timestamp = ts;
+        rc = iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, 99, kIoctlKgslGpuCommand, &cmd);
+        assert(rc == 0);
+    }
+    KgslCmdstreamReadtimestampCtxtid read_ts{};
+    read_ts.context_id = 7;
+    read_ts.type = 1; // KGSL_TIMESTAMP_QUEUED
+    rc = iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, 99, kIoctlKgslCmdstreamReadtimestampCtxtid, &read_ts);
+    assert(rc == 0 && read_ts.timestamp == 12);
+
+    g_retired_on_gpu = 11;
+    read_ts.type = 3; // KGSL_TIMESTAMP_RETIRED
+    read_ts.timestamp = 0;
+    rc = iss_quest_kgsl_ioctl_with_fn(&MockQuestKernelIoctl, 99, kIoctlKgslCmdstreamReadtimestampCtxtid, &read_ts);
+    assert(rc == 0 && read_ts.timestamp == 11);
+
+    // 5. Test ELF GOT patching on a real dlopen'd shared library.
+    void* lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    assert(lib != nullptr);
+    using AllocBoFn = int (*)(int, uint64_t*, unsigned int*);
+    auto fn = reinterpret_cast<AllocBoFn>(dlsym(lib, "mock_driver_alloc_bo"));
+    assert(fn != nullptr);
+
+    int patched = iss_patch_elf_ioctl_got(reinterpret_cast<void*>(fn), argv[1],
+                                          reinterpret_cast<void*>(&ReplacementIoctlForGotTest));
+    assert(patched >= 1);
+
+    uint64_t gpuaddr = 0;
+    unsigned int bo_id = 0;
+    rc = fn(99, &gpuaddr, &bo_id);
+    assert(rc == 0);
+    assert(gpuaddr == 0x700012340000ULL);
+    assert(bo_id == 42);
+
+    dlclose(lib);
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            p = Path(temp)
+            shutil.copy2(loader_cpp, p / "vk_driver_loader.cpp")
+            shutil.copy2(loader_h, p / "vk_driver_loader.h")
+            (p / "mock_driver.cpp").write_text(mock_driver_src)
+            (p / "harness.cpp").write_text(harness_src)
+
+            drv_compile = subprocess.run(
+                ["c++", "-std=c++20", "-O2", "-fPIC", "-shared",
+                 str(p / "mock_driver.cpp"), "-o", str(p / "libvulkan_freedreno.so")],
+                capture_output=True, text=True
+            )
+            self.assertEqual(0, drv_compile.returncode, drv_compile.stderr)
+
+            harness_compile = subprocess.run(
+                ["c++", "-std=c++20", "-O2",
+                 str(p / "harness.cpp"), str(p / "vk_driver_loader.cpp"),
+                 "-ldl", "-lpthread", "-o", str(p / "harness")],
+                capture_output=True, text=True
+            )
+            self.assertEqual(0, harness_compile.returncode, harness_compile.stderr)
+
+            run_res = subprocess.run(
+                [str(p / "harness"), str(p / "libvulkan_freedreno.so")],
+                capture_output=True, text=True
+            )
+            self.assertEqual(0, run_res.returncode, run_res.stderr)
+
+    def test_lds_atomic_minmax_cas_lowering_is_wired(self):
+        profile_h = (ROOT / "port/gpu/shadps4/shader_recompiler/profile.h").read_text()
+        self.assertIn("bool needs_shared_atomic_minmax_cas{};", profile_h)
+
+        cache_cpp = (
+            ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp"
+        ).read_text()
+        self.assertIn(".needs_shared_atomic_minmax_cas =", cache_cpp)
+        self.assertIn("eQualcommProprietary", cache_cpp)
+
+        ser_cpp = (
+            ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
+        ).read_text()
+        self.assertIn("ShaderBinaryVersion = 11u;", ser_cpp)
+
+        atomic_cpp = (
+            ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp"
+        ).read_text()
+        self.assertIn("SharedAtomicMinMaxCasImpl", atomic_cpp)
+        self.assertIn("ctx.OpAtomicCompareExchange", atomic_cpp)
+        for fn in (
+            "EmitSharedAtomicUMax32",
+            "EmitSharedAtomicUMax64",
+            "EmitSharedAtomicSMax32",
+            "EmitSharedAtomicSMax64",
+            "EmitSharedAtomicUMin32",
+            "EmitSharedAtomicUMin64",
+            "EmitSharedAtomicSMin32",
+            "EmitSharedAtomicSMin64",
+        ):
+            self.assertIn(fn, atomic_cpp)
+
+
+if __name__ == "__main__":
+    unittest.main()

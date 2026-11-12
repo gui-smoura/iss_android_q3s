@@ -299,9 +299,14 @@ final class LanguageCatalogTrPl {
   {"Reuse identical Vulkan descriptors","Aynı Vulkan tanımlayıcılarını yeniden kullan","Ponownie używaj identycznych deskryptorów Vulkan"},
   {"Partial descriptor updates (experimental)","Kısmi tanımlayıcı güncellemeleri (deneysel)","Częściowe aktualizacje deskryptorów (eksperymentalne)"},
   {"Vulkan secondary passes: depth only (experimental)","Vulkan ikincil geçişleri: yalnızca derinlik (deneysel)","Dodatkowe przebiegi Vulkan: tylko głębia (eksperymentalne)"},
+  {"Clear shader cache","Gölgelendirici önbelleğini temizle","Wyczyść pamięć podręczną shaderów"},
+  {"Shader and pipeline cache cleared.","Gölgelendirici ve işlem hattı önbelleği temizlendi.","Wyczyszczono pamięć podręczną shaderów i potoków."},
+  {"Invalid driver library name","Geçersiz sürücü kitaplığı adı","Nieprawidłowa nazwa biblioteki sterownika"},
+  {"Driver ZIP is missing meta.json or a .so library","Sürücü ZIP'inde meta.json veya .so kitaplığı yok","W ZIP sterownika brakuje meta.json lub biblioteki .so"},
   };
   for(String[] row:rows)TEXT.put(row[0],new String[]{row[1],row[2]});
  }
+
  static String text(String language,String english){
   String[] result=TEXT.get(english);
   return result==null?english:result["tr".equals(language)?0:1];

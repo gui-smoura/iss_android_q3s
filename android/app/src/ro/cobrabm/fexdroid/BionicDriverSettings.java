@@ -70,6 +70,7 @@ final class BionicDriverSettings {
   long table=b.getLong(40);int size=b.getShort(58)&65535,count=b.getShort(60)&65535;
   if(size<64||table<64||count==0||table>data.length-(long)size*count)throw new IOException(AppLanguage.text("Invalid ELF sections","Seções ELF inválidas"));
   boolean hal=false;
+  byte[][] accepted={"HMI\0".getBytes(),"vk_icdGetInstanceProcAddr\0".getBytes(),"vkGetInstanceProcAddr\0".getBytes()};
   for(int i=0;i<count;i++){
    int section=(int)(table+(long)i*size);if(b.getInt(section+4)!=11)continue; // SHT_DYNSYM
    long offset=b.getLong(section+24),length=b.getLong(section+32),entry=b.getLong(section+56);int link=b.getInt(section+40);
@@ -77,7 +78,13 @@ final class BionicDriverSettings {
    int strings=(int)(table+(long)link*size);long start=b.getLong(strings+24),bytes=b.getLong(strings+32);
    if(start<0||bytes<0||start>data.length-bytes)throw new IOException(AppLanguage.text("Invalid driver strings","Textos do driver inválidos"));
    for(long at=offset;at+24<=offset+length;at+=entry){int name=b.getInt((int)at);if(name<0||name+4>bytes)continue;
-    int p=(int)(start+name);if(data[p]=='H'&&data[p+1]=='M'&&data[p+2]=='I'&&data[p+3]==0&&b.getShort((int)at+6)!=0&&(data[(int)at+4]>>>4&15)!=0)hal=true;
+    if(b.getShort((int)at+6)==0||(data[(int)at+4]>>>4&15)==0)continue;
+    int p=(int)(start+name);
+    for(byte[] sym:accepted){
+     if(name+sym.length>bytes)continue;
+     boolean match=true;for(int k=0;k<sym.length;k++)if(data[p+k]!=sym[k]){match=false;break;}
+     if(match){hal=true;break;}
+    }
    }
   }
   if(!hal)throw new IOException(AppLanguage.text("Driver does not export the Android Vulkan HAL (HMI)","O driver não exporta a HAL Vulkan Android (HMI)"));
@@ -88,16 +95,56 @@ final class BionicDriverSettings {
    try{
     archive=File.createTempFile("driver-",".zip",a.getCacheDir());
     try(InputStream in=a.getContentResolver().openInputStream(uri)){if(in==null)throw new IOException(AppLanguage.text("Cannot open driver ZIP","Não foi possível abrir o ZIP do driver"));Files.write(archive.toPath(),read(in,32*1024*1024));}
-    byte[] library;JSONObject meta;
+    byte[] library;JSONObject meta=null;
     try(ZipFile zip=new ZipFile(archive)){
-     ZipEntry metadata=zip.getEntry("meta.json");if(metadata==null)throw new IOException(AppLanguage.text("Driver ZIP is missing meta.json","O ZIP do driver não contém meta.json"));
-     try(InputStream in=zip.getInputStream(metadata)){meta=new JSONObject(new String(read(in,65536),java.nio.charset.StandardCharsets.UTF_8));}
-     String lib=meta.getString("libraryName");if(!"libvulkan_freedreno.so".equals(lib))throw new IOException(AppLanguage.text("Expected Turnip libvulkan_freedreno.so","Esperado driver Turnip libvulkan_freedreno.so"));
-     if(meta.getInt("minApi")>Build.VERSION.SDK_INT)throw new IOException(AppLanguage.text("Driver requires a newer Android version","O driver exige uma versão mais nova do Android"));
-     ZipEntry entry=zip.getEntry(lib);if(entry==null)throw new IOException(AppLanguage.text("Driver library is missing","Biblioteca do driver ausente"));
+     ZipEntry metadata=zip.getEntry("meta.json");
+     if(metadata==null)metadata=zip.getEntry("driver.json");
+     ZipEntry firstSo=null;
+     if(metadata==null){
+      java.util.Enumeration<? extends ZipEntry> entries=zip.entries();
+      while(entries.hasMoreElements()){
+       ZipEntry e=entries.nextElement();if(e.isDirectory())continue;
+       String en=e.getName();
+       if(metadata==null&&(en.endsWith("/meta.json")||en.endsWith("/driver.json")||"meta.json".equals(en)||"driver.json".equals(en)))metadata=e;
+       if(firstSo==null&&en.endsWith(".so"))firstSo=e;
+      }
+     }
+     ZipEntry entry=null;
+     if(metadata!=null){
+      try(InputStream in=zip.getInputStream(metadata)){meta=new JSONObject(new String(read(in,65536),java.nio.charset.StandardCharsets.UTF_8));}
+      if(meta.optInt("minApi",0)>Build.VERSION.SDK_INT)throw new IOException(AppLanguage.text("Driver requires a newer Android version","O driver exige uma versão mais nova do Android"));
+      String lib=meta.optString("libraryName","libvulkan_freedreno.so");
+      int slash=lib.lastIndexOf('/');if(slash>=0)lib=lib.substring(slash+1);
+      if(!lib.endsWith(".so"))throw new IOException(AppLanguage.text("Invalid driver library name","Nome da biblioteca do driver inválido"));
+      entry=zip.getEntry(lib);
+      if(entry==null){
+       String metaName=metadata.getName();int dirSlash=metaName.lastIndexOf('/');
+       if(dirSlash>=0)entry=zip.getEntry(metaName.substring(0,dirSlash+1)+lib);
+      }
+      if(entry==null){
+       java.util.Enumeration<? extends ZipEntry> entries=zip.entries();
+       while(entries.hasMoreElements()){
+        ZipEntry e=entries.nextElement();if(e.isDirectory())continue;
+        if(e.getName().endsWith("/"+lib)||e.getName().equals(lib)){entry=e;break;}
+        if(firstSo==null&&e.getName().endsWith(".so"))firstSo=e;
+       }
+      }
+      if(entry==null)entry=firstSo;
+     }else if(firstSo!=null){
+      entry=firstSo;
+      String baseName=firstSo.getName();int slash=baseName.lastIndexOf('/');if(slash>=0)baseName=baseName.substring(slash+1);
+      meta=new JSONObject().put("name",baseName).put("libraryName","libvulkan_freedreno.so").put("minApi",30);
+     }else{
+      throw new IOException(AppLanguage.text("Driver ZIP is missing meta.json or a .so library","O ZIP do driver não contém meta.json nem biblioteca .so"));
+     }
+     if(entry==null)throw new IOException(AppLanguage.text("Driver library is missing","Biblioteca do driver ausente"));
      try(InputStream in=zip.getInputStream(entry)){library=read(in,MAX_LIBRARY);}
     }
-    validateElf(library);name=meta.getString("name");if(name.length()>160)throw new IOException(AppLanguage.text("Invalid driver name","Nome do driver inválido"));
+    validateElf(library);
+    name=meta.optString("name",meta.optString("driverVersion","Custom Turnip Driver")).trim();
+    if(name.isEmpty())name="Custom Turnip Driver";
+    if(name.length()>160)name=name.substring(0,160);
+    meta.put("name",name);meta.put("libraryName","libvulkan_freedreno.so");
     StringBuilder hash=new StringBuilder();for(byte v:MessageDigest.getInstance("SHA-256").digest(library))hash.append(String.format(java.util.Locale.US,"%02x",v&255));
     File root=new File(a.getFilesDir(),"issport/custom-drivers");root.mkdirs();File dest=new File(root,hash.toString());
     if(!dest.isDirectory()){
@@ -115,3 +162,4 @@ final class BionicDriverSettings {
   },"iss-driver-import").start();
  }
 }
+

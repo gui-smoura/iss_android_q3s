@@ -41,15 +41,14 @@ def check_inputs(manifest, commit, root=ROOT):
         verify((root / name).read_bytes(), digest, name)
 
 
-def payloads(archive, manifest):
-    verify(archive, manifest["artifact_sha256"], "Actions artifact")
-    with zipfile.ZipFile(io.BytesIO(archive)) as artifact:
-        apk = verify(artifact.read(manifest["apk"]), manifest["apk_sha256"], "APK")
-        metadata = json.loads(artifact.read("RELEASE-METADATA.json"))
-        if metadata["source_commit"] != manifest["source_commit"]:
-            raise RuntimeError("Bloodframe bootstrap source commit mismatch")
-    with zipfile.ZipFile(io.BytesIO(apk)) as package:
-        runtime = verify(package.read("assets/runtime.tar.gz"), manifest["runtime_sha256"], "runtime")
+PUBLIC_RELEASE_APK_URL = (
+    "https://github.com/erickmendes22/iss_android/releases/download/"
+    "v0.2-Android-Bionic/inFAMOUS-Second-Son-Daedalus-v0.2.apk"
+)
+PUBLIC_RELEASE_APK_SHA256 = "192d1c099b1e694b72b2cfae6fa4f56be34f504cc6aac268fb5500b31ce07f63"
+
+
+def extract_verified_runtime_members(runtime, manifest):
     result = {}
     with tarfile.open(fileobj=io.BytesIO(runtime), mode="r:gz") as tar:
         for name, pin in manifest["files"].items():
@@ -68,6 +67,25 @@ def payloads(archive, manifest):
     return result
 
 
+def payloads(archive, manifest):
+    verify(archive, manifest["artifact_sha256"], "Actions artifact")
+    with zipfile.ZipFile(io.BytesIO(archive)) as artifact:
+        apk = verify(artifact.read(manifest["apk"]), manifest["apk_sha256"], "APK")
+        metadata = json.loads(artifact.read("RELEASE-METADATA.json"))
+        if metadata["source_commit"] != manifest["source_commit"]:
+            raise RuntimeError("Bloodframe bootstrap source commit mismatch")
+    with zipfile.ZipFile(io.BytesIO(apk)) as package:
+        runtime = verify(package.read("assets/runtime.tar.gz"), manifest["runtime_sha256"], "runtime")
+    return extract_verified_runtime_members(runtime, manifest)
+
+
+def payloads_from_release_apk(apk_bytes, manifest):
+    verify(apk_bytes, PUBLIC_RELEASE_APK_SHA256, "Public release APK")
+    with zipfile.ZipFile(io.BytesIO(apk_bytes)) as package:
+        runtime = package.read("assets/runtime.tar.gz")
+    return extract_verified_runtime_members(runtime, manifest)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--commit", required=True)
@@ -76,19 +94,26 @@ def main():
     args = parser.parse_args()
     manifest = json.loads(MANIFEST.read_text())
     check_inputs(manifest, args.commit)
+    verified = None
     if args.archive:
-        archive = args.archive.read_bytes()
+        verified = payloads(args.archive.read_bytes(), manifest)
     else:
         token = os.environ.get("GH_TOKEN")
-        if not token:
-            raise RuntimeError("Supply --archive or GH_TOKEN with Actions read access")
-        url = (f'https://api.github.com/repos/{manifest["repository"]}/actions/artifacts/'
-               f'{manifest["artifact_id"]}/zip')
-        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
-                                                      "Accept": "application/vnd.github+json"})
-        with urllib.request.build_opener(ArtifactRedirect()).open(request, timeout=120) as response:
-            archive = response.read()
-    verified = payloads(archive, manifest)
+        if token:
+            url = (f'https://api.github.com/repos/{manifest["repository"]}/actions/artifacts/'
+                   f'{manifest["artifact_id"]}/zip')
+            request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
+                                                           "Accept": "application/vnd.github+json"})
+            try:
+                with urllib.request.build_opener(ArtifactRedirect()).open(request, timeout=120) as response:
+                    verified = payloads(response.read(), manifest)
+            except Exception as exc:
+                print(f"Bloodframe: Actions artifact unavailable ({exc}); falling back to public pinned release APK")
+        if verified is None:
+            request = urllib.request.Request(PUBLIC_RELEASE_APK_URL,
+                                             headers={"User-Agent": "iss-bloodframe-bootstrap/1.0"})
+            with urllib.request.urlopen(request, timeout=180) as response:
+                verified = payloads_from_release_apk(response.read(), manifest)
     for relative, data in verified.items():
         target = args.output / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -96,8 +121,9 @@ def main():
         temporary.write_bytes(data)
         temporary.replace(target)
     print(f'Bloodframe: verified unchanged {manifest["bloodframe_commit"][:12]} '
-          f'from build 71 ({len(verified)} library/license files)')
+          f'({len(verified)} library/license files)')
 
 
 if __name__ == "__main__":
     main()
+

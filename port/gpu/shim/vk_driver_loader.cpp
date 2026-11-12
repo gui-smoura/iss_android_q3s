@@ -21,14 +21,547 @@
 #include "vk_driver_loader.h"
 
 #include <dlfcn.h>
+#include <elf.h>
+#include <errno.h>
+#include <link.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <atomic>
+#include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstddef>
 #include <cstring>
 #include <mutex>
 
 namespace {
+
+// ---------------------------------------------------------------------------------------------
+// Meta Quest 3 / 3S (Horizon OS) KGSL ioctl compatibility layer for Mesa Turnip.
+//
+// On Horizon OS (Quest 3 / 3S, Snapdragon XR2 Gen 2 / Adreno 740v3), untrusted_app SELinux rules
+// allow opening /dev/kgsl-3d0 and querying properties (IOCTL_KGSL_DEVICE_GETPROPERTY), but block
+// legacy KGSL memory management ioctls (IOCTL_KGSL_GPUMEM_ALLOC_ID and IOCTL_KGSL_GPUMEM_FREE_ID)
+// and IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID with EACCES (Permission denied).
+//
+// Horizon OS permits the newer GPU object ioctls (IOCTL_KGSL_GPUOBJ_ALLOC, IOCTL_KGSL_GPUOBJ_INFO,
+// IOCTL_KGSL_GPUOBJ_FREE) and IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID. When a direct Turnip driver
+// is loaded via ISS_VULKAN_DRIVER, we patch its ELF GOT slot for `ioctl` so that any EACCES/EPERM
+// on those legacy KGSL ioctls transparently falls back to the allowed GPUOBJ / WAITTIMESTAMP
+// ioctls (adapted from Droid-Deck PR #642, kgsl_compat.c & kgslpoll.c).
+// ---------------------------------------------------------------------------------------------
+constexpr unsigned int kKgslIocType = 0x09;
+
+struct KgslGpumemAllocId {
+    unsigned int id;
+    unsigned int flags;
+    size_t size;
+    size_t mmapsize;
+    uint64_t gpuaddr;
+    uint64_t pad[2];
+};
+
+struct KgslGpumemFreeId {
+    unsigned int id;
+    unsigned int pad;
+};
+
+struct KgslGpuobjAlloc {
+    uint64_t size;
+    uint64_t flags;
+    uint64_t va_len;
+    uint64_t mmapsize;
+    unsigned int id;
+    unsigned int metadata_len;
+    uint64_t metadata;
+};
+
+struct KgslGpuobjFree {
+    uint64_t flags;
+    uint64_t priv;
+    unsigned int id;
+    unsigned int type;
+    unsigned int len;
+};
+
+struct KgslGpuobjInfo {
+    uint64_t gpuaddr;
+    uint64_t flags;
+    uint64_t size;
+    uint64_t va_len;
+    uint64_t va_addr;
+    unsigned int id;
+};
+
+struct KgslCmdstreamReadtimestampCtxtid {
+    unsigned int context_id;
+    unsigned int type;
+    unsigned int timestamp;
+};
+
+struct KgslDeviceWaittimestampCtxtid {
+    unsigned int context_id;
+    unsigned int timestamp;
+    unsigned int timeout;
+};
+
+struct KgslDrawctxtCreate {
+    unsigned int flags;
+    unsigned int drawctxt_id;
+};
+
+struct KgslDrawctxtDestroy {
+    unsigned int drawctxt_id;
+};
+
+struct KgslGpuCommand {
+    uint64_t flags;
+    uint64_t cmdlist;
+    unsigned int cmdsize;
+    unsigned int numcmds;
+    uint64_t objlist;
+    unsigned int objsize;
+    unsigned int numobjs;
+    uint64_t synclist;
+    unsigned int syncsize;
+    unsigned int numsyncs;
+    unsigned int context_id;
+    unsigned int timestamp;
+};
+
+struct KgslGpuAuxCommand {
+    uint64_t flags;
+    uint64_t cmdlist;
+    unsigned int cmdsize;
+    unsigned int numcmds;
+    uint64_t synclist;
+    unsigned int syncsize;
+    unsigned int numsyncs;
+    unsigned int context_id;
+    unsigned int timestamp;
+};
+
+#if INTPTR_MAX == INT64_MAX
+static_assert(sizeof(KgslGpumemAllocId) == 48, "kgsl_gpumem_alloc_id layout");
+static_assert(sizeof(KgslGpumemFreeId) == 8, "kgsl_gpumem_free_id layout");
+static_assert(sizeof(KgslGpuobjAlloc) == 48, "kgsl_gpuobj_alloc layout");
+static_assert(sizeof(KgslGpuobjFree) == 32, "kgsl_gpuobj_free layout");
+static_assert(sizeof(KgslGpuobjInfo) == 48, "kgsl_gpuobj_info layout");
+static_assert(sizeof(KgslCmdstreamReadtimestampCtxtid) == 12,
+              "kgsl_cmdstream_readtimestamp_ctxtid layout");
+static_assert(sizeof(KgslDeviceWaittimestampCtxtid) == 12,
+              "kgsl_device_waittimestamp_ctxtid layout");
+static_assert(sizeof(KgslGpuCommand) == 64, "kgsl_gpu_command layout");
+static_assert(sizeof(KgslGpuAuxCommand) == 48, "kgsl_gpu_aux_command layout");
+#endif
+
+constexpr unsigned long kIoctlKgslDeviceWaittimestampCtxtid =
+    _IOW(kKgslIocType, 0x07, KgslDeviceWaittimestampCtxtid);
+constexpr unsigned long kIoctlKgslDrawctxtCreate =
+    _IOWR(kKgslIocType, 0x13, KgslDrawctxtCreate);
+constexpr unsigned long kIoctlKgslDrawctxtDestroy =
+    _IOW(kKgslIocType, 0x14, KgslDrawctxtDestroy);
+constexpr unsigned long kIoctlKgslCmdstreamReadtimestampCtxtid =
+    _IOR(kKgslIocType, 0x16, KgslCmdstreamReadtimestampCtxtid);
+constexpr unsigned long kIoctlKgslGpumemAllocId =
+    _IOWR(kKgslIocType, 0x34, KgslGpumemAllocId);
+constexpr unsigned long kIoctlKgslGpumemFreeId =
+    _IOWR(kKgslIocType, 0x35, KgslGpumemFreeId);
+constexpr unsigned long kIoctlKgslGpuobjAlloc =
+    _IOWR(kKgslIocType, 0x45, KgslGpuobjAlloc);
+constexpr unsigned long kIoctlKgslGpuobjFree =
+    _IOW(kKgslIocType, 0x46, KgslGpuobjFree);
+constexpr unsigned long kIoctlKgslGpuobjInfo =
+    _IOWR(kKgslIocType, 0x47, KgslGpuobjInfo);
+constexpr unsigned long kIoctlKgslGpuCommand =
+    _IOWR(kKgslIocType, 0x4a, KgslGpuCommand);
+constexpr unsigned long kIoctlKgslGpuAuxCommand =
+    _IOWR(kKgslIocType, 0x4c, KgslGpuAuxCommand);
+
+constexpr unsigned int kKgslTimestampQueued = 1;
+constexpr unsigned int kKgslTimestampRetired = 3;
+
+constexpr size_t kMaxTrackedContexts = 64;
+constexpr size_t kMaxTrackedTimestamps = 256;
+
+struct TrackedKgslContext {
+    bool active;
+    unsigned int context_id;
+    unsigned int latest_queued;
+    unsigned int latest_retired;
+    unsigned int count;
+    unsigned int pending[kMaxTrackedTimestamps];
+};
+
+std::mutex g_kgsl_mutex;
+TrackedKgslContext g_kgsl_contexts[kMaxTrackedContexts]{};
+std::atomic<bool> g_logged_gpuobj_fallback{false};
+std::atomic<bool> g_logged_timestamp_fallback{false};
+
+bool TimestampGreater(unsigned int a, unsigned int b) {
+    return static_cast<int32_t>(a - b) > 0;
+}
+
+TrackedKgslContext* FindOrCreateKgslContextLocked(unsigned int context_id) {
+    TrackedKgslContext* free_slot = nullptr;
+    for (auto& slot : g_kgsl_contexts) {
+        if (slot.active && slot.context_id == context_id) {
+            return &slot;
+        }
+        if (!slot.active && !free_slot) {
+            free_slot = &slot;
+        }
+    }
+    if (!free_slot) {
+        free_slot = &g_kgsl_contexts[context_id % kMaxTrackedContexts];
+    }
+    std::memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->active = true;
+    free_slot->context_id = context_id;
+    return free_slot;
+}
+
+void RecordKgslSubmission(unsigned int context_id, unsigned int timestamp) {
+    std::lock_guard<std::mutex> lock(g_kgsl_mutex);
+    TrackedKgslContext* ctx = FindOrCreateKgslContextLocked(context_id);
+    if (ctx->count == 0 && ctx->latest_queued == 0 && ctx->latest_retired == 0) {
+        ctx->latest_queued = timestamp;
+    } else if (TimestampGreater(timestamp, ctx->latest_queued)) {
+        ctx->latest_queued = timestamp;
+    }
+    for (unsigned int i = 0; i < ctx->count; ++i) {
+        if (ctx->pending[i] == timestamp) {
+            return;
+        }
+    }
+    if (ctx->count == kMaxTrackedTimestamps) {
+        if (TimestampGreater(ctx->pending[0], ctx->latest_retired)) {
+            ctx->latest_retired = ctx->pending[0];
+        }
+        std::memmove(&ctx->pending[0], &ctx->pending[1],
+                     (kMaxTrackedTimestamps - 1) * sizeof(unsigned int));
+        ctx->count = kMaxTrackedTimestamps - 1;
+    }
+    // Insert sorted in ascending timestamp order.
+    unsigned int pos = ctx->count;
+    while (pos > 0 && TimestampGreater(ctx->pending[pos - 1], timestamp)) {
+        ctx->pending[pos] = ctx->pending[pos - 1];
+        --pos;
+    }
+    ctx->pending[pos] = timestamp;
+    ++ctx->count;
+}
+
+void DestroyKgslContext(unsigned int context_id) {
+    std::lock_guard<std::mutex> lock(g_kgsl_mutex);
+    for (auto& slot : g_kgsl_contexts) {
+        if (slot.active && slot.context_id == context_id) {
+            slot.active = false;
+            slot.count = 0;
+            return;
+        }
+    }
+}
+
+int FallbackGpumemAllocId(IssRealIoctlFn real_ioctl, int fd, KgslGpumemAllocId* req) {
+    if (!req) {
+        errno = EFAULT;
+        return -1;
+    }
+    KgslGpuobjAlloc alloc{};
+    alloc.size = req->size;
+    alloc.flags = req->flags;
+    if (real_ioctl(fd, kIoctlKgslGpuobjAlloc, &alloc) < 0) {
+        return -1;
+    }
+    KgslGpuobjInfo info{};
+    info.id = alloc.id;
+    if (real_ioctl(fd, kIoctlKgslGpuobjInfo, &info) < 0) {
+        const int saved_errno = errno;
+        KgslGpuobjFree free_req{};
+        free_req.id = alloc.id;
+        real_ioctl(fd, kIoctlKgslGpuobjFree, &free_req);
+        errno = saved_errno;
+        return -1;
+    }
+    req->id = alloc.id;
+    req->flags = static_cast<unsigned int>(info.flags);
+    req->size = static_cast<size_t>(info.size);
+    req->mmapsize = static_cast<size_t>(alloc.mmapsize ? alloc.mmapsize : info.size);
+    req->gpuaddr = info.gpuaddr;
+    if (!g_logged_gpuobj_fallback.exchange(true)) {
+        std::fprintf(stderr,
+                     "Vulkan: Quest KGSL compatibility active (GPUMEM_ALLOC_ID -> GPUOBJ_ALLOC)\n");
+    }
+    return 0;
+}
+
+int FallbackGpumemFreeId(IssRealIoctlFn real_ioctl, int fd, KgslGpumemFreeId* req) {
+    if (!req) {
+        errno = EFAULT;
+        return -1;
+    }
+    KgslGpuobjFree free_req{};
+    free_req.id = req->id;
+    return real_ioctl(fd, kIoctlKgslGpuobjFree, &free_req);
+}
+
+int FallbackReadtimestampCtxtid(IssRealIoctlFn real_ioctl, int fd,
+                                KgslCmdstreamReadtimestampCtxtid* req) {
+    if (!req) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (!g_logged_timestamp_fallback.exchange(true)) {
+        std::fprintf(stderr,
+                     "Vulkan: Quest KGSL timestamp compatibility active "
+                     "(READTIMESTAMP_CTXTID -> WAITTIMESTAMP_CTXTID)\n");
+    }
+    unsigned int pending_copy[kMaxTrackedTimestamps];
+    unsigned int pending_count = 0;
+    unsigned int latest_queued = 0;
+    unsigned int latest_retired = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_kgsl_mutex);
+        TrackedKgslContext* ctx = FindOrCreateKgslContextLocked(req->context_id);
+        latest_queued = ctx->latest_queued;
+        latest_retired = ctx->latest_retired;
+        if (req->type == kKgslTimestampQueued) {
+            req->timestamp = latest_queued;
+            errno = 0;
+            return 0;
+        }
+        pending_count = ctx->count;
+        if (pending_count > 0) {
+            std::memcpy(pending_copy, ctx->pending, pending_count * sizeof(unsigned int));
+        }
+    }
+
+    if (pending_count == 0) {
+        req->timestamp = latest_retired;
+        errno = 0;
+        return 0;
+    }
+
+    unsigned int retired = latest_retired;
+    unsigned int completed_count = 0;
+    for (unsigned int i = 0; i < pending_count; ++i) {
+        KgslDeviceWaittimestampCtxtid wait_req{};
+        wait_req.context_id = req->context_id;
+        wait_req.timestamp = pending_copy[i];
+        wait_req.timeout = 0;
+        if (real_ioctl(fd, kIoctlKgslDeviceWaittimestampCtxtid, &wait_req) == 0) {
+            retired = pending_copy[i];
+            completed_count = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    // If none completed with timeout=0, do a 1ms poll on the earliest pending timestamp so
+    // Turnip's spin-wait loop yields smoothly instead of burning CPU.
+    if (completed_count == 0) {
+        KgslDeviceWaittimestampCtxtid wait_req{};
+        wait_req.context_id = req->context_id;
+        wait_req.timestamp = pending_copy[0];
+        wait_req.timeout = 1;
+        if (real_ioctl(fd, kIoctlKgslDeviceWaittimestampCtxtid, &wait_req) == 0) {
+            retired = pending_copy[0];
+            completed_count = 1;
+        }
+    }
+
+    if (completed_count > 0) {
+        std::lock_guard<std::mutex> lock(g_kgsl_mutex);
+        TrackedKgslContext* ctx = FindOrCreateKgslContextLocked(req->context_id);
+        if (TimestampGreater(retired, ctx->latest_retired) || ctx->latest_retired == 0) {
+            ctx->latest_retired = retired;
+        }
+        unsigned int write_idx = 0;
+        for (unsigned int i = 0; i < ctx->count; ++i) {
+            if (TimestampGreater(ctx->pending[i], retired)) {
+                ctx->pending[write_idx++] = ctx->pending[i];
+            }
+        }
+        ctx->count = write_idx;
+    }
+
+    req->timestamp = retired;
+    errno = 0;
+    return 0;
+}
+
+int RealKernelIoctl(int fd, unsigned long request, void* arg) {
+    static IssRealIoctlFn real_fn = []() -> IssRealIoctlFn {
+        if (void* libc = dlopen("libc.so", RTLD_LAZY | RTLD_NOLOAD)) {
+            if (void* sym = dlsym(libc, "ioctl")) {
+                return reinterpret_cast<IssRealIoctlFn>(sym);
+            }
+        }
+        if (void* sym = dlsym(RTLD_DEFAULT, "ioctl")) {
+            return reinterpret_cast<IssRealIoctlFn>(sym);
+        }
+        return nullptr;
+    }();
+    if (!real_fn) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return real_fn(fd, request, arg);
+}
+
+int DriverIoctlHook(int fd, unsigned long request, ...) {
+    va_list ap;
+    va_start(ap, request);
+    void* arg = va_arg(ap, void*);
+    va_end(ap);
+    return iss_quest_kgsl_ioctl_with_fn(&RealKernelIoctl, fd, request, arg);
+}
+
+struct PatchGotContext {
+    uintptr_t target_addr;
+    const char* driver_path;
+    void* replacement;
+    int patched_count;
+};
+
+bool PathEndsWith(const char* full, const char* suffix) {
+    if (!full || !suffix || !*full || !*suffix) {
+        return false;
+    }
+    if (std::strcmp(full, suffix) == 0) {
+        return true;
+    }
+    const char* base = std::strrchr(suffix, '/');
+    const char* suffix_name = base ? base + 1 : suffix;
+    const size_t full_len = std::strlen(full);
+    const size_t name_len = std::strlen(suffix_name);
+    return full_len >= name_len &&
+           std::strcmp(full + (full_len - name_len), suffix_name) == 0;
+}
+
+void PatchRelaTable(uintptr_t base_addr, const ElfW(Rela)* rela, size_t rela_count,
+                    const ElfW(Sym)* symtab, const char* strtab, void* replacement,
+                    int* patched_count) {
+    if (!rela || !symtab || !strtab || !replacement) {
+        return;
+    }
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const uintptr_t page_mask = ~(static_cast<uintptr_t>(page_size > 0 ? page_size : 4096) - 1);
+
+    for (size_t i = 0; i < rela_count; ++i) {
+#if INTPTR_MAX == INT64_MAX
+        const size_t sym_idx = ELF64_R_SYM(rela[i].r_info);
+#else
+        const size_t sym_idx = ELF32_R_SYM(rela[i].r_info);
+#endif
+        if (sym_idx == 0) {
+            continue;
+        }
+        const char* sym_name = strtab + symtab[sym_idx].st_name;
+        if (std::strcmp(sym_name, "ioctl") != 0 &&
+            std::strcmp(sym_name, "__ioctl") != 0) {
+            continue;
+        }
+        auto* got_slot = reinterpret_cast<void**>(base_addr + rela[i].r_offset);
+        const uintptr_t page_start = reinterpret_cast<uintptr_t>(got_slot) & page_mask;
+        const size_t protect_len =
+            (reinterpret_cast<uintptr_t>(got_slot) + sizeof(void*)) - page_start;
+        if (mprotect(reinterpret_cast<void*>(page_start), protect_len,
+                     PROT_READ | PROT_WRITE) == 0 ||
+            mprotect(reinterpret_cast<void*>(page_start), protect_len,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            *got_slot = replacement;
+            ++(*patched_count);
+        }
+    }
+}
+
+
+int IteratePhdrCallback(struct dl_phdr_info* info, size_t /*size*/, void* data) {
+    auto* ctx = static_cast<PatchGotContext*>(data);
+    bool matches = false;
+    if (ctx->target_addr != 0) {
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+            if (info->dlpi_phdr[i].p_type != PT_LOAD) {
+                continue;
+            }
+            const uintptr_t seg_start = info->dlpi_addr + info->dlpi_phdr[i].p_vaddr;
+            const uintptr_t seg_end = seg_start + info->dlpi_phdr[i].p_memsz;
+            if (ctx->target_addr >= seg_start && ctx->target_addr < seg_end) {
+                matches = true;
+                break;
+            }
+        }
+    }
+    if (!matches && PathEndsWith(info->dlpi_name, ctx->driver_path)) {
+        matches = true;
+    }
+    if (!matches) {
+        return 0;
+    }
+
+    const ElfW(Dyn)* dyn = nullptr;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = reinterpret_cast<const ElfW(Dyn)*>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) {
+        return 0;
+    }
+
+    const ElfW(Sym)* symtab = nullptr;
+    const char* strtab = nullptr;
+    const ElfW(Rela)* jmprel = nullptr;
+    size_t pltrelsz = 0;
+    const ElfW(Rela)* rela = nullptr;
+    size_t relasz = 0;
+
+    auto resolve_ptr = [&](ElfW(Addr) ptr) -> uintptr_t {
+        // On glibc, dynamic section pointers may already be relocated; on Android Bionic they are
+        // relative to dlpi_addr unless > dlpi_addr.
+        return (ptr < info->dlpi_addr) ? (info->dlpi_addr + ptr) : ptr;
+    };
+
+    for (; dyn->d_tag != DT_NULL; ++dyn) {
+        switch (dyn->d_tag) {
+        case DT_SYMTAB:
+            symtab = reinterpret_cast<const ElfW(Sym)*>(resolve_ptr(dyn->d_un.d_ptr));
+            break;
+        case DT_STRTAB:
+            strtab = reinterpret_cast<const char*>(resolve_ptr(dyn->d_un.d_ptr));
+            break;
+        case DT_JMPREL:
+            jmprel = reinterpret_cast<const ElfW(Rela)*>(resolve_ptr(dyn->d_un.d_ptr));
+            break;
+        case DT_PLTRELSZ:
+            pltrelsz = dyn->d_un.d_val;
+            break;
+        case DT_RELA:
+            rela = reinterpret_cast<const ElfW(Rela)*>(resolve_ptr(dyn->d_un.d_ptr));
+            break;
+        case DT_RELASZ:
+            relasz = dyn->d_un.d_val;
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (jmprel && pltrelsz >= sizeof(ElfW(Rela))) {
+        PatchRelaTable(info->dlpi_addr, jmprel, pltrelsz / sizeof(ElfW(Rela)), symtab, strtab,
+                       ctx->replacement, &ctx->patched_count);
+    }
+    if (rela && relasz >= sizeof(ElfW(Rela))) {
+        PatchRelaTable(info->dlpi_addr, rela, relasz / sizeof(ElfW(Rela)), symtab, strtab,
+                       ctx->replacement, &ctx->patched_count);
+    }
+    return 0;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Android hwvulkan HAL ABI. The NDK ships neither <hardware/hardware.h> nor <hardware/hwvulkan.h>,
@@ -172,6 +705,19 @@ IssVkGetInstanceProcAddr OpenHal(void* hmi, const char* driver) {
     return &HalGetInstanceProcAddr;
 }
 
+void MaybeHookDirectDriverIoctl(void* sym_in_driver, const char* driver_path) {
+    const char* disable = std::getenv("ISS_QUEST_KGSL_SHIM");
+    if (disable && std::strcmp(disable, "0") == 0) {
+        return;
+    }
+    const int patched = iss_patch_elf_ioctl_got(
+        sym_in_driver, driver_path, reinterpret_cast<void*>(&DriverIoctlHook));
+    if (patched > 0) {
+        std::fprintf(stderr, "Vulkan: installed Quest KGSL ioctl hook (%d GOT slot%s) for %s\n",
+                     patched, patched == 1 ? "" : "s", driver_path);
+    }
+}
+
 IssVkGetInstanceProcAddr Load() {
     const char* driver = std::getenv("ISS_VULKAN_DRIVER");
     if (!driver || !*driver) {
@@ -213,17 +759,83 @@ IssVkGetInstanceProcAddr Load() {
     }
     if (!gipa) {
         if (void* hmi = dlsym(lib, "HMI")) {
+            MaybeHookDirectDriverIoctl(hmi, driver);
             return OpenHal(hmi, driver);
         }
         std::fprintf(stderr, "Vulkan: driver %s exports none of vk_icdGetInstanceProcAddr, "
                              "vkGetInstanceProcAddr and HMI (Android Vulkan HAL module)\n", driver);
         return nullptr;
     }
+    MaybeHookDirectDriverIoctl(gipa, driver);
     std::fprintf(stderr, "Vulkan: direct driver %s via %s\n", driver, entry);
     return reinterpret_cast<IssVkGetInstanceProcAddr>(gipa);
 }
 
 } // namespace
+
+extern "C" __attribute__((visibility("default"))) int
+iss_quest_kgsl_ioctl_with_fn(IssRealIoctlFn real_ioctl, int fd, unsigned long request, void* arg) {
+    if (!real_ioctl) {
+        errno = EINVAL;
+        return -1;
+    }
+    const int ret = real_ioctl(fd, request, arg);
+    if (ret == 0) {
+        if (request == kIoctlKgslGpuCommand && arg) {
+            const auto* cmd = static_cast<const KgslGpuCommand*>(arg);
+            RecordKgslSubmission(cmd->context_id, cmd->timestamp);
+        } else if (request == kIoctlKgslGpuAuxCommand && arg) {
+            const auto* aux = static_cast<const KgslGpuAuxCommand*>(arg);
+            RecordKgslSubmission(aux->context_id, aux->timestamp);
+        } else if (request == kIoctlKgslDrawctxtCreate && arg) {
+            const auto* create_req = static_cast<const KgslDrawctxtCreate*>(arg);
+            std::lock_guard<std::mutex> lock(g_kgsl_mutex);
+            FindOrCreateKgslContextLocked(create_req->drawctxt_id);
+        } else if (request == kIoctlKgslDrawctxtDestroy && arg) {
+            const auto* destroy_req = static_cast<const KgslDrawctxtDestroy*>(arg);
+            DestroyKgslContext(destroy_req->drawctxt_id);
+        }
+        return 0;
+    }
+
+    const int saved_errno = errno;
+    if (saved_errno != EACCES && saved_errno != EPERM) {
+        return ret;
+    }
+
+    if (request == kIoctlKgslGpumemAllocId) {
+        return FallbackGpumemAllocId(real_ioctl, fd, static_cast<KgslGpumemAllocId*>(arg));
+    }
+    if (request == kIoctlKgslGpumemFreeId) {
+        return FallbackGpumemFreeId(real_ioctl, fd, static_cast<KgslGpumemFreeId*>(arg));
+    }
+    if (request == kIoctlKgslCmdstreamReadtimestampCtxtid) {
+        const auto* read_req = static_cast<const KgslCmdstreamReadtimestampCtxtid*>(arg);
+        if (read_req &&
+            (read_req->type == kKgslTimestampQueued || read_req->type == kKgslTimestampRetired)) {
+            return FallbackReadtimestampCtxtid(
+                real_ioctl, fd, static_cast<KgslCmdstreamReadtimestampCtxtid*>(arg));
+        }
+    }
+
+    errno = saved_errno;
+    return ret;
+}
+
+extern "C" __attribute__((visibility("default"))) int
+iss_patch_elf_ioctl_got(void* sym_in_driver, const char* driver_path, void* replacement_ioctl) {
+    if (!replacement_ioctl) {
+        return 0;
+    }
+    PatchGotContext ctx{
+        reinterpret_cast<uintptr_t>(sym_in_driver),
+        driver_path,
+        replacement_ioctl,
+        0,
+    };
+    dl_iterate_phdr(&IteratePhdrCallback, &ctx);
+    return ctx.patched_count;
+}
 
 extern "C" __attribute__((visibility("default"))) IssVkGetInstanceProcAddr
 iss_vk_get_instance_proc_addr(void) {
@@ -232,3 +844,4 @@ iss_vk_get_instance_proc_addr(void) {
     std::call_once(once, [] { gipa = Load(); });
     return gipa;
 }
+

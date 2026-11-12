@@ -639,6 +639,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .block1d_as_2d = AmdGpu::Block1DAs2D(),
         .bc_tiny_decode = AmdGpu::BcTinyDecode(),
         .fragment_contraction_policy = Shader::Backend::SPIRV::FragmentContractionEnabled(),
+        .needs_shared_atomic_minmax_cas = [&] {
+            if (const char* env = std::getenv("TLG_LDS_ATOMIC_CAS")) {
+                return env[0] != '0';
+            }
+            if (const char* env = std::getenv("ISS_LDS_ATOMIC_CAS")) {
+                return env[0] != '0';
+            }
+#ifdef __ANDROID__
+            return true;
+#else
+            return instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
+#endif
+        }(),
     };
     // tlg: the recompiler switches (ISS_ names arrive as TLG_), one line each on stdout (the run
     // log keeps it; LOG_INFO is filtered out there), for A/B reports.
@@ -650,6 +663,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 profile.needs_lds_barriers ? "on" : "off");
     std::printf("GPU: fragment contraction %s (no depth export, at most one color target)\n",
                 profile.fragment_contraction_policy ? "on" : "off");
+    std::printf("GPU: LDS atomic min/max CAS lowering %s\n",
+                profile.needs_shared_atomic_minmax_cas ? "on" : "off");
+
 
     // tlg: BP08, start from the driver blob saved by an earlier session (same GPU and driver).
     std::vector<u8> driver_blob;

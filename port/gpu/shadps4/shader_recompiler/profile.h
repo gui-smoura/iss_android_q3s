@@ -65,8 +65,12 @@ struct Profile {
     // 0: preserve NoContraction, 1: guarded release-025 rule. A full word also
     // changes the cache profile size instead of reusing old uninitialized padding.
     u32 fragment_contraction_policy{};
+    /// Lower Workgroup (LDS) integer atomic min/max to an OpAtomicCompareExchange loop to avoid
+    /// Qualcomm proprietary driver (libllvm-qgl.so) SIGSEGV on @llvm.qgpu.atomic.imax.oob.p3i32.
+    bool needs_shared_atomic_minmax_cas{};
 
     bool operator==(const Profile&) const = default;
 };
 
 } // namespace Shader
+

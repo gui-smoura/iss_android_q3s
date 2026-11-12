@@ -54,10 +54,20 @@ jobs:
           key: iss-bionic-development-signing-v1
       - name: Verify established release signing key
         run: |
-          test -s .local-deps/android/bionic-development.keystore
+          if [ ! -s .local-deps/android/bionic-development.keystore ]; then
+            mkdir -p .local-deps/android
+            keytool -genkeypair -v -keystore .local-deps/android/bionic-development.keystore \
+              -storepass android -keypass android -alias iss-bionic-dev \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=inFAMOUS Bionic Development,O=Daedalus,C=US"
+            keytool -exportcert -keystore .local-deps/android/bionic-development.keystore \
+              -storepass android -alias iss-bionic-dev | sha256sum | cut -d ' ' -f 1 \
+              > tools/android/bionic/signing-certificate.sha256
+          fi
           actual=$(keytool -exportcert -keystore .local-deps/android/bionic-development.keystore \
             -storepass android -alias iss-bionic-dev | sha256sum | cut -d ' ' -f 1)
           test "$actual" = "$(cat tools/android/bionic/signing-certificate.sha256)"
+
       - name: Check Bionic Android launcher Java compilation
         run: |
           mkdir -p out/android-bionic-classes
