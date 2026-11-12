@@ -70,7 +70,7 @@ Id SharedAtomicU64CmpSwap(EmitContext& ctx, Id offset, Id value, Id cmp_value) {
                                        cmp_value);
 }
 
-/// Lowers Workgroup (LDS) integer atomic min/max to an OpAtomicLoad + OpAtomicCompareExchange
+/// Lowers Workgroup (LDS) integer atomic min/max to an OpLoad + OpAtomicCompareExchange
 /// structured loop. Qualcomm's proprietary compiler (/vendor/lib64/libllvm-qgl.so on Horizon OS /
 /// Quest 3S) segfaults with signal 11 when optimizing @llvm.qgpu.atomic.imax.oob.p3i32.i32 on
 /// __local* (address space 3) pointers during vkCreateComputePipelines.
@@ -90,7 +90,10 @@ Id SharedAtomicMinMaxCasImpl(EmitContext& ctx, Id type, Id pointer, Id value,
     ctx.OpBranch(loop_body);
 
     ctx.AddLabel(loop_body);
-    const Id old_val{ctx.OpAtomicLoad(type, pointer, scope, semantics)};
+    // Plain OpLoad on purpose: Qualcomm's libllvm-qgl.so lowers a Workgroup OpAtomicLoad to
+    // @llvm.qgpu.atomic.add.oob.p3i32.i32(ptr, 0) and segfaults at +0x988494 on it. A stale
+    // value is harmless because the CAS below validates it and the loop retries.
+    const Id old_val{ctx.OpLoad(type, pointer)};
     const Id need_update{(ctx.*compare_func)(ctx.U1[1], value, old_val)};
     ctx.OpSelectionMerge(if_merge_block, spv::SelectionControlMask::MaskNone);
     ctx.OpBranchConditional(need_update, cas_block, if_merge_block);
@@ -131,10 +134,11 @@ Id SharedAtomicMinMaxCasU64(EmitContext& ctx, Id offset, Id value,
 }
 
 /// Lowers general Workgroup (LDS) integer atomic RMW operations (IAdd, ISub, And, Or, Xor, Inc,
-/// Dec) to an OpAtomicLoad + binary op + OpAtomicCompareExchange structured loop. Qualcomm's
+/// Dec) to an OpLoad + binary op + OpAtomicCompareExchange structured loop. Qualcomm's
 /// proprietary compiler (/vendor/lib64/libllvm-qgl.so+0x988494 on Horizon OS / Quest 3S) also
 /// segfaults with signal 11 on @llvm.qgpu.atomic.add.oob.p3i32.i32 (e.g. DS_ADD_RTN_U32 with 0)
-/// and other 2-operand __local* RMW intrinsics, whereas OpAtomicLoad + OpAtomicCompareExchange
+/// and other 2-operand __local* RMW intrinsics (including OpAtomicLoad, which it lowers to
+/// atomic.add(ptr, 0)), whereas OpLoad + OpAtomicCompareExchange
 /// compiles cleanly.
 Id SharedAtomicBinOpCasImpl(EmitContext& ctx, Id type, Id pointer, Id value,
                             Id (Sirit::Module::*bin_op)(Id, Id, Id)) {
@@ -150,7 +154,10 @@ Id SharedAtomicBinOpCasImpl(EmitContext& ctx, Id type, Id pointer, Id value,
     ctx.OpBranch(loop_body);
 
     ctx.AddLabel(loop_body);
-    const Id old_val{ctx.OpAtomicLoad(type, pointer, scope, semantics)};
+    // Plain OpLoad on purpose: Qualcomm's libllvm-qgl.so lowers a Workgroup OpAtomicLoad to
+    // @llvm.qgpu.atomic.add.oob.p3i32.i32(ptr, 0) and segfaults at +0x988494 on it. A stale
+    // value is harmless because the CAS below validates it and the loop retries.
+    const Id old_val{ctx.OpLoad(type, pointer)};
     const Id new_val{(ctx.*bin_op)(type, old_val, value)};
     const Id prev_val{ctx.OpAtomicCompareExchange(type, pointer, scope, semantics, semantics,
                                                   new_val, old_val)};

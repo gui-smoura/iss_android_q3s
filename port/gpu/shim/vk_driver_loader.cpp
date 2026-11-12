@@ -239,6 +239,9 @@ std::mutex g_kgsl_mutex;
 TrackedKgslContext g_kgsl_contexts[kMaxTrackedContexts]{};
 std::atomic<bool> g_logged_gpuobj_fallback{false};
 std::atomic<bool> g_logged_timestamp_fallback{false};
+std::atomic<bool> g_logged_wait_denied{false};
+std::atomic<bool> g_logged_wait_errno{false};
+std::atomic<bool> g_logged_wait_ok{false};
 std::atomic<int> g_logged_kgsl_errors{0};
 
 bool TimestampGreater(unsigned int a, unsigned int b) {
@@ -417,15 +420,31 @@ int FallbackReadtimestampCtxtid(IssRealIoctlFn real_ioctl, int fd,
         wait_req.timestamp = pending_copy[i];
         wait_req.timeout = 0;
         if (real_ioctl(fd, kIoctlKgslDeviceWaittimestampCtxtid, &wait_req) == 0) {
+            if (!g_logged_wait_ok.exchange(true)) {
+                std::fprintf(stderr,
+                             "Vulkan: Quest KGSL WAITTIMESTAMP_CTXTID works (ctx=%u ts=%u)\n",
+                             req->context_id, pending_copy[i]);
+            }
             retired = pending_copy[i];
             completed_count = i + 1;
         } else if (errno == EACCES || errno == EPERM) {
             // If WAITTIMESTAMP_CTXTID is also denied by SELinux, retire up to latest_queued so
             // Turnip never stalls or returns VK_ERROR_DEVICE_LOST.
+            if (!g_logged_wait_denied.exchange(true)) {
+                std::fprintf(stderr,
+                             "Vulkan: Quest KGSL WAITTIMESTAMP_CTXTID denied (errno=%d); "
+                             "retiring timestamps without GPU sync (expect corruption)\n",
+                             errno);
+            }
             retired = latest_queued;
             completed_count = pending_count;
             break;
         } else {
+            if (!g_logged_wait_errno.exchange(true)) {
+                std::fprintf(stderr,
+                             "Vulkan: Quest KGSL WAITTIMESTAMP_CTXTID pending (errno=%d %s)\n",
+                             errno, std::strerror(errno));
+            }
             break;
         }
     }

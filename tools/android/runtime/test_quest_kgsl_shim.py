@@ -392,7 +392,14 @@ int main(int argc, char** argv) {
         ser_cpp = (
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
         ).read_text()
-        self.assertIn("ShaderBinaryVersion = 13u;", ser_cpp)
+        self.assertIn("ShaderBinaryVersion = 14u;", ser_cpp)
+
+        atomic_cpp = (
+            ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp"
+        ).read_text()
+        # QGL lowers a Workgroup OpAtomicLoad to atomic.add(ptr, 0) and crashes on it.
+        self.assertNotIn("ctx.OpAtomicLoad(", atomic_cpp)
+        self.assertEqual(2, atomic_cpp.count("const Id old_val{ctx.OpLoad(type, pointer)};"))
 
         if shutil.which("c++"):
             with tempfile.TemporaryDirectory() as temp:
