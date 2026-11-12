@@ -35,7 +35,8 @@ using u64=uint64_t;
 using u32=uint32_t;
 #define ASSERT_MSG(condition, ...) assert(condition)
 namespace vk {
-enum class Result { eSuccess, eErrorDeviceLost };
+enum class Result { eSuccess, eTimeout, eErrorDeviceLost };
+inline const char* to_string(Result) { return ""; }
 using Semaphore=int;
 using Fence=int;
 enum class PipelineStageFlagBits { eAllCommands, eColorAttachmentOutput };
