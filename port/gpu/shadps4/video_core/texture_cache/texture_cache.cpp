@@ -52,9 +52,15 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 
     // Set up garbage collection parameters.
     if (!instance.CanReportMemoryUsage()) {
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+        trigger_gc_memory = 512_MB;
+        pressure_gc_memory = 768_MB;
+        critical_gc_memory = 1_GB + 256_MB;
+#else
         trigger_gc_memory = 0;
         pressure_gc_memory = DEFAULT_PRESSURE_GC_MEMORY;
         critical_gc_memory = DEFAULT_CRITICAL_GC_MEMORY;
+#endif
         return;
     }
 
@@ -1804,6 +1810,10 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 
 void TextureCache::GarbageCollectImages() {
     TlgStats::Timer gc_timer{TlgStats::t_gc};
+    static const u64 forced_budget = [] {
+        const char* env = std::getenv("TLG_GC_BUDGET_MB");
+        return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
+    }();
     if (instance.CanReportMemoryUsage()) {
         const auto memory_budget = instance.GetMemoryBudgetSnapshot();
         total_used_memory = memory_budget.usage;
@@ -1813,15 +1823,16 @@ void TextureCache::GarbageCollectImages() {
         // collector evicted images used two or three frames ago on every submission and wrote
         // GPU-written ones back. Compare with the driver's current budget instead.
         // TLG_GC_BUDGET_MB=N: this rule with a fixed budget on any GPU (tests on a desktop).
-        static const u64 forced_budget = [] {
-            const char* env = std::getenv("TLG_GC_BUDGET_MB");
-            return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
-        }();
         if (instance.IsIntegrated() || forced_budget) {
-            const u64 budget = forced_budget && memory_budget.budget && instance.IsIntegrated()
-                                   ? std::min(forced_budget,memory_budget.budget)
-                                   : forced_budget ? forced_budget : memory_budget.budget;
+            u64 budget = forced_budget && memory_budget.budget && instance.IsIntegrated()
+                             ? std::min(forced_budget, memory_budget.budget)
+                             : forced_budget ? forced_budget : memory_budget.budget;
             if (budget != 0) {
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+                if (!forced_budget) {
+                    budget = budget > RESIDENCY_HEADROOM ? budget - RESIDENCY_HEADROOM : budget / 2;
+                }
+#endif
                 trigger_gc_memory = budget / 10 * 7;
                 pressure_gc_memory = budget / 100 * 85;
                 critical_gc_memory = budget / 100 * 95;
@@ -1830,6 +1841,11 @@ void TextureCache::GarbageCollectImages() {
                 ApplyResidencyHeadroom();
             }
         }
+    } else if (forced_budget != 0) {
+        trigger_gc_memory = forced_budget / 10 * 7;
+        pressure_gc_memory = forced_budget / 100 * 85;
+        critical_gc_memory = forced_budget / 100 * 95;
+        ApplyResidencyHeadroom();
     }
     if (total_used_memory < trigger_gc_memory) {
         return;

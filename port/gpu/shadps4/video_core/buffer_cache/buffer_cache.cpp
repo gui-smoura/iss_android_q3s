@@ -35,7 +35,11 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 // already bound on some drivers, so it pays to bind a little ahead in few larger operations
 // rather than a block at a time as the game streams data in.
 static constexpr u64 RESIDENCY_GRANULE_SIZE = 16_MB;
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+static constexpr u64 RESIDENCY_CHUNK_SIZE = 64_MB;
+#else
 static constexpr u64 RESIDENCY_CHUNK_SIZE = 256_MB;
+#endif
 
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |

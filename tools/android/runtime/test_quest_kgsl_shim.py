@@ -343,13 +343,21 @@ int main(int argc, char** argv) {
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp"
         ).read_text()
         self.assertIn(".needs_shared_atomic_minmax_cas =", cache_cpp)
-        self.assertIn("return true;", cache_cpp)
+        self.assertIn("instance.GetDriverID() == vk::DriverId::eQualcommProprietary", cache_cpp)
+        cas_block = cache_cpp.split(".needs_shared_atomic_minmax_cas =", 1)[1].split("}(),", 1)[0]
+        self.assertNotIn("#ifdef __ANDROID__", cas_block)
 
         atomic_cpp = (
             ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp"
         ).read_text()
-        self.assertIn("SharedAtomicMinMaxCasImpl", atomic_cpp)
-        self.assertIn("SharedAtomicBinOpCasImpl", atomic_cpp)
+        for helper in (
+            "SharedAtomicMinMaxCasImpl",
+            "SharedAtomicBinOpCasImpl",
+            "SharedAtomicCmpSwapNonAtomicImpl",
+        ):
+            self.assertIn(helper, atomic_cpp)
+            body = atomic_cpp.split(f"Id {helper}(", 1)[1].split("\n}\n", 1)[0]
+            self.assertNotIn("OpAtomic", body)
         self.assertIn("ctx.OpAtomicCompareExchange", atomic_cpp)
         for fn in (
             "EmitSharedAtomicIAdd32",
@@ -370,12 +378,18 @@ int main(int argc, char** argv) {
             "EmitSharedAtomicOr64",
             "EmitSharedAtomicXor32",
             "EmitSharedAtomicXor64",
+            "EmitSharedAtomicCmpSwap32",
+            "EmitSharedAtomicCmpSwap64",
             "EmitSharedAtomicInc32",
             "EmitSharedAtomicInc64",
             "EmitSharedAtomicDec32",
             "EmitSharedAtomicDec64",
         ):
             self.assertIn(fn, atomic_cpp)
+        for cmp_fn in ("EmitSharedAtomicCmpSwap32", "EmitSharedAtomicCmpSwap64"):
+            cmp_body = atomic_cpp.split(f"Id {cmp_fn}(", 1)[1].split("\n}\n", 1)[0]
+            self.assertIn("ctx.profile.needs_shared_atomic_minmax_cas", cmp_body)
+            self.assertIn("SharedAtomicCmpSwapNonAtomicImpl", cmp_body)
 
         compute_cpp = (
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_compute_pipeline.cpp"
@@ -392,14 +406,11 @@ int main(int argc, char** argv) {
         ser_cpp = (
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
         ).read_text()
-        self.assertIn("ShaderBinaryVersion = 14u;", ser_cpp)
+        self.assertIn("ShaderBinaryVersion = 15u;", ser_cpp)
 
-        atomic_cpp = (
-            ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp"
-        ).read_text()
-        # QGL lowers a Workgroup OpAtomicLoad to atomic.add(ptr, 0) and crashes on it.
+        # QGL segfaults on ANY @llvm.qgpu.atomic.*.oob.p3i32.i32 intrinsic on Workgroup memory.
         self.assertNotIn("ctx.OpAtomicLoad(", atomic_cpp)
-        self.assertEqual(2, atomic_cpp.count("const Id old_val{ctx.OpLoad(type, pointer)};"))
+        self.assertEqual(3, atomic_cpp.count("const Id old_val{ctx.OpLoad(type, pointer)};"))
 
         if shutil.which("c++"):
             with tempfile.TemporaryDirectory() as temp:

@@ -70,51 +70,27 @@ Id SharedAtomicU64CmpSwap(EmitContext& ctx, Id offset, Id value, Id cmp_value) {
                                        cmp_value);
 }
 
-/// Lowers Workgroup (LDS) integer atomic min/max to an OpLoad + OpAtomicCompareExchange
-/// structured loop. Qualcomm's proprietary compiler (/vendor/lib64/libllvm-qgl.so on Horizon OS /
-/// Quest 3S) segfaults with signal 11 when optimizing @llvm.qgpu.atomic.imax.oob.p3i32.i32 on
-/// __local* (address space 3) pointers during vkCreateComputePipelines.
+/// Lowers Workgroup (LDS) integer atomic min/max to non-atomic OpLoad + conditional OpStore.
+/// Qualcomm's proprietary compiler (/vendor/lib64/libllvm-qgl.so+0x988494 on Horizon OS / Quest 3S)
+/// segfaults with signal 11 when compiling ANY @llvm.qgpu.atomic.*.oob.p3i32.i32 intrinsic on
+/// __local* (address space 3) pointers (verified across imax, add, and cmp.xchg, even with
+/// VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT). Plain OpLoad/OpStore on __local* compile cleanly.
 Id SharedAtomicMinMaxCasImpl(EmitContext& ctx, Id type, Id pointer, Id value,
                              Id (Sirit::Module::*compare_func)(Id, Id, Id)) {
-    const auto [scope, semantics]{AtomicArgs(ctx)};
-    const Id loop_header{ctx.OpLabel()};
-    const Id loop_body{ctx.OpLabel()};
-    const Id cas_block{ctx.OpLabel()};
-    const Id if_merge_block{ctx.OpLabel()};
-    const Id continue_block{ctx.OpLabel()};
     const Id merge_block{ctx.OpLabel()};
+    const Id store_block{ctx.OpLabel()};
 
-    ctx.OpBranch(loop_header);
-    ctx.AddLabel(loop_header);
-    ctx.OpLoopMerge(merge_block, continue_block, spv::LoopControlMask::MaskNone);
-    ctx.OpBranch(loop_body);
-
-    ctx.AddLabel(loop_body);
-    // Plain OpLoad on purpose: Qualcomm's libllvm-qgl.so lowers a Workgroup OpAtomicLoad to
-    // @llvm.qgpu.atomic.add.oob.p3i32.i32(ptr, 0) and segfaults at +0x988494 on it. A stale
-    // value is harmless because the CAS below validates it and the loop retries.
     const Id old_val{ctx.OpLoad(type, pointer)};
     const Id need_update{(ctx.*compare_func)(ctx.U1[1], value, old_val)};
-    ctx.OpSelectionMerge(if_merge_block, spv::SelectionControlMask::MaskNone);
-    ctx.OpBranchConditional(need_update, cas_block, if_merge_block);
+    ctx.OpSelectionMerge(merge_block, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(need_update, store_block, merge_block);
 
-    ctx.AddLabel(cas_block);
-    const Id prev_val{ctx.OpAtomicCompareExchange(type, pointer, scope, semantics, semantics,
-                                                  value, old_val)};
-    const Id cas_done{ctx.OpIEqual(ctx.U1[1], prev_val, old_val)};
-    ctx.OpBranch(if_merge_block);
-
-    ctx.AddLabel(if_merge_block);
-    const Id done{ctx.OpPhi(ctx.U1[1], ctx.true_value, loop_body, cas_done, cas_block)};
-    const Id result{ctx.OpPhi(type, old_val, loop_body, prev_val, cas_block)};
-    ctx.OpBranch(continue_block);
-
-    ctx.AddLabel(continue_block);
-    const Id retry{ctx.OpLogicalNot(ctx.U1[1], done)};
-    ctx.OpBranchConditional(retry, loop_header, merge_block);
+    ctx.AddLabel(store_block);
+    ctx.OpStore(pointer, value);
+    ctx.OpBranch(merge_block);
 
     ctx.AddLabel(merge_block);
-    return result;
+    return old_val;
 }
 
 Id SharedAtomicMinMaxCasU32(EmitContext& ctx, Id offset, Id value,
@@ -134,42 +110,31 @@ Id SharedAtomicMinMaxCasU64(EmitContext& ctx, Id offset, Id value,
 }
 
 /// Lowers general Workgroup (LDS) integer atomic RMW operations (IAdd, ISub, And, Or, Xor, Inc,
-/// Dec) to an OpLoad + binary op + OpAtomicCompareExchange structured loop. Qualcomm's
-/// proprietary compiler (/vendor/lib64/libllvm-qgl.so+0x988494 on Horizon OS / Quest 3S) also
-/// segfaults with signal 11 on @llvm.qgpu.atomic.add.oob.p3i32.i32 (e.g. DS_ADD_RTN_U32 with 0)
-/// and other 2-operand __local* RMW intrinsics (including OpAtomicLoad, which it lowers to
-/// atomic.add(ptr, 0)), whereas OpLoad + OpAtomicCompareExchange
-/// compiles cleanly.
+/// Dec) to non-atomic OpLoad + binary op + OpStore so no @llvm.qgpu.atomic.*.oob.p3i32.i32
+/// intrinsic is emitted for Qualcomm's QGL compiler.
 Id SharedAtomicBinOpCasImpl(EmitContext& ctx, Id type, Id pointer, Id value,
                             Id (Sirit::Module::*bin_op)(Id, Id, Id)) {
-    const auto [scope, semantics]{AtomicArgs(ctx)};
-    const Id loop_header{ctx.OpLabel()};
-    const Id loop_body{ctx.OpLabel()};
-    const Id continue_block{ctx.OpLabel()};
-    const Id merge_block{ctx.OpLabel()};
-
-    ctx.OpBranch(loop_header);
-    ctx.AddLabel(loop_header);
-    ctx.OpLoopMerge(merge_block, continue_block, spv::LoopControlMask::MaskNone);
-    ctx.OpBranch(loop_body);
-
-    ctx.AddLabel(loop_body);
-    // Plain OpLoad on purpose: Qualcomm's libllvm-qgl.so lowers a Workgroup OpAtomicLoad to
-    // @llvm.qgpu.atomic.add.oob.p3i32.i32(ptr, 0) and segfaults at +0x988494 on it. A stale
-    // value is harmless because the CAS below validates it and the loop retries.
     const Id old_val{ctx.OpLoad(type, pointer)};
     const Id new_val{(ctx.*bin_op)(type, old_val, value)};
-    const Id prev_val{ctx.OpAtomicCompareExchange(type, pointer, scope, semantics, semantics,
-                                                  new_val, old_val)};
-    const Id done{ctx.OpIEqual(ctx.U1[1], prev_val, old_val)};
-    ctx.OpBranch(continue_block);
+    ctx.OpStore(pointer, new_val);
+    return old_val;
+}
 
-    ctx.AddLabel(continue_block);
-    const Id retry{ctx.OpLogicalNot(ctx.U1[1], done)};
-    ctx.OpBranchConditional(retry, loop_header, merge_block);
+Id SharedAtomicCmpSwapNonAtomicImpl(EmitContext& ctx, Id type, Id pointer, Id value, Id cmp_value) {
+    const Id merge_block{ctx.OpLabel()};
+    const Id store_block{ctx.OpLabel()};
+
+    const Id old_val{ctx.OpLoad(type, pointer)};
+    const Id matches{ctx.OpIEqual(ctx.U1[1], old_val, cmp_value)};
+    ctx.OpSelectionMerge(merge_block, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(matches, store_block, merge_block);
+
+    ctx.AddLabel(store_block);
+    ctx.OpStore(pointer, value);
+    ctx.OpBranch(merge_block);
 
     ctx.AddLabel(merge_block);
-    return prev_val;
+    return old_val;
 }
 
 Id SharedAtomicBinOpCasU32(EmitContext& ctx, Id offset, Id value,
@@ -424,10 +389,22 @@ Id EmitSharedAtomicISub64(EmitContext& ctx, Id offset, Id value) {
 }
 
 Id EmitSharedAtomicCmpSwap32(EmitContext& ctx, Id offset, Id value, Id cmp_value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        const Id shift_id{ctx.ConstU32(2U)};
+        const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
+        const Id pointer{ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index)};
+        return SharedAtomicCmpSwapNonAtomicImpl(ctx, ctx.U32[1], pointer, value, cmp_value);
+    }
     return SharedAtomicU32CmpSwap(ctx, offset, value, cmp_value);
 }
 
 Id EmitSharedAtomicCmpSwap64(EmitContext& ctx, Id offset, Id value, Id cmp_value) {
+    if (ctx.profile.needs_shared_atomic_minmax_cas) {
+        const Id shift_id{ctx.ConstU32(3U)};
+        const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
+        const Id pointer{ctx.EmitSharedMemoryAccess(ctx.shared_u64, ctx.shared_memory_u64, index)};
+        return SharedAtomicCmpSwapNonAtomicImpl(ctx, ctx.U64, pointer, value, cmp_value);
+    }
     return SharedAtomicU64CmpSwap(ctx, offset, value, cmp_value);
 }
 

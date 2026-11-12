@@ -353,7 +353,17 @@ int FallbackGpumemFreeId(IssRealIoctlFn real_ioctl, int fd, KgslGpumemFreeId* re
     }
     KgslGpuobjFree free_req{};
     free_req.id = req->id;
-    return real_ioctl(fd, kIoctlKgslGpuobjFree, &free_req);
+    const int ret = real_ioctl(fd, kIoctlKgslGpuobjFree, &free_req);
+    if (ret < 0) {
+        const int saved_errno = errno;
+        const int logged = g_logged_kgsl_errors.fetch_add(1, std::memory_order_relaxed);
+        if (logged < 8) {
+            std::fprintf(stderr, "Vulkan: Quest KGSL GPUOBJ_FREE id=%u failed (errno=%d %s)\n",
+                         req->id, saved_errno, std::strerror(saved_errno));
+        }
+        errno = saved_errno;
+    }
+    return ret;
 }
 
 int FallbackGpumemGetInfo(IssRealIoctlFn real_ioctl, int fd, KgslGpumemGetInfo* req) {

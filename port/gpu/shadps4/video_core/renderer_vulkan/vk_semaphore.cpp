@@ -71,7 +71,11 @@ void Semaphore::Wait(u64 tick, std::source_location caller) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    vk::Result wait_result{};
+    while ((wait_result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT)) !=
+           vk::Result::eSuccess) {
+        ASSERT_MSG(wait_result == vk::Result::eTimeout, "Failed to wait for master semaphore: {}",
+                   vk::to_string(wait_result));
     }
     if (compare) {
         WaitDiagnostics::Get().Add(caller.file_name(), caller.line(), 0,

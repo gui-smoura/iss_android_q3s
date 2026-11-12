@@ -117,6 +117,11 @@ private:
         vk::Image image{};
         vk::DeviceMemory memory{};
         vk::ImageView view{};
+        vk::Buffer staging_buffer{};
+        vk::DeviceMemory staging_memory{};
+        void* staging_mapped{};
+        vk::CommandBuffer copy_cmd{};
+        vk::Fence copy_fence{};
         int release_fd{-1}; ///< the app's release fence of the last frame, until it is waited on
         bool acquire_imported{false}; ///< release_fd was imported into image_acquired[index]
     };
@@ -127,6 +132,7 @@ private:
     void PeerGone() const;
     int ExportPresentReady();
     void ImportAcquire(u32 index);
+    void StageAndCopyToAhb(u32 index);
 
 private:
     const Instance& instance;
@@ -138,6 +144,7 @@ private:
     std::vector<vk::Semaphore> image_acquired;
     std::vector<vk::Semaphore> present_ready;
     std::deque<u32> free_queue; ///< buffers the game may render into, in release order
+    vk::CommandPool staging_cmd_pool{};
     u32 width = 0;
     u32 height = 0;
     u32 image_count = 3;
@@ -154,6 +161,8 @@ private:
     bool zero_extent = false;
     bool needs_recreation = true;
     bool sync_import_ok = true; ///< importing sync files as semaphores works (else poll them)
+    bool use_staging = false; ///< render to device-local VkImage + copy to linear CPU-locked AHB
+    bool staging_coherent = true;
 };
 
 } // namespace Vulkan

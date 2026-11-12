@@ -6,10 +6,12 @@
 #include <poll.h>
 #include <unistd.h>
 #include <algorithm>
-#include <utility>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <utility>
 #include "common/assert.h"
 #include "tlg_settings.h"
 #include "iss_bionic_perf.h"
@@ -31,6 +33,9 @@ constexpr u32 AhbFormat = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
 constexpr u64 AhbUsage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                          AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
                          AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+constexpr u64 AhbStagingUsage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                                AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
 
 /// ISS_PRESENT_BUFFERS: the number of buffers (3 by default: one shown, one pending, one rendered).
 /// With Lossless Scaling frame generation (multiplier 2-4) a cycle holds one buffer per frame it shows
@@ -68,15 +73,45 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
     : instance{instance_}, window{window_} {
     framegen_multiplier = lsfg_multiplier;
     image_count = BufferCount(lsfg_multiplier);
-    const vk::PhysicalDeviceExternalSemaphoreInfo semaphore_info{
-        .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
-    };
-    const auto semaphore_props = instance.GetPhysicalDevice().getExternalSemaphoreProperties(semaphore_info);
-    ASSERT_MSG(
-        (semaphore_props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eExportable) &&
-            (semaphore_props.externalSemaphoreFeatures & vk::ExternalSemaphoreFeatureFlagBits::eImportable),
-        "The Vulkan driver cannot export and import sync-file semaphores (SYNC_FD): the AHB "
-        "swapchain cannot synchronize with the app");
+    use_staging = [&] {
+        if (const char* env = std::getenv("ISS_AHB_STAGING")) {
+            if (env[0] == '1') {
+                return true;
+            }
+            if (env[0] == '0') {
+                return false;
+            }
+        }
+        // Mesa Turnip's Vulkan AHB import / UBWC layout can disagree with Horizon OS
+        // SurfaceFlinger on Quest 3/3S (producing vertical static stripes). Render to an
+        // internal device-local image and stage via linear CPU-locked AHB on non-Qualcomm drivers.
+        return instance.GetDriverID() != vk::DriverId::eQualcommProprietary;
+    }();
+    if (!use_staging) {
+        const vk::PhysicalDeviceExternalSemaphoreInfo semaphore_info{
+            .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
+        };
+        const auto semaphore_props =
+            instance.GetPhysicalDevice().getExternalSemaphoreProperties(semaphore_info);
+        ASSERT_MSG(
+            (semaphore_props.externalSemaphoreFeatures &
+             vk::ExternalSemaphoreFeatureFlagBits::eExportable) &&
+                (semaphore_props.externalSemaphoreFeatures &
+                 vk::ExternalSemaphoreFeatureFlagBits::eImportable),
+            "The Vulkan driver cannot export and import sync-file semaphores (SYNC_FD): the AHB "
+            "swapchain cannot synchronize with the app");
+    } else {
+        auto [pool_res, pool] = instance.GetDevice().createCommandPool({
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+        });
+        ASSERT_MSG(pool_res == vk::Result::eSuccess,
+                   "Failed to create AHB staging command pool: {}", vk::to_string(pool_res));
+        staging_cmd_pool = pool;
+    }
+    std::printf("AHB swapchain: mode=%s (driver_id=%d)\n",
+                use_staging ? "cpu-staged-linear" : "native-ahb",
+                static_cast<int>(instance.GetDriverID()));
     if (IssPresent::Client::Configured()) {
         if (!client.Connect(window.GetWidth(), window.GetHeight(), AhbFormat, image_count,
                             TlgSettings::Get().vsync.load())) {
@@ -97,14 +132,24 @@ void Swapchain::UpdateVsync() {
 
 Swapchain::~Swapchain() {
     Destroy();
+    if (staging_cmd_pool) {
+        instance.GetDevice().destroyCommandPool(staging_cmd_pool);
+        staging_cmd_pool = {};
+    }
     client.Disconnect();
 }
 
 std::pair<u32, u32> Swapchain::AcquireQueues() const {
+    if (use_staging) {
+        return {VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED};
+    }
     return {VK_QUEUE_FAMILY_FOREIGN_EXT, instance.GetGraphicsQueueFamilyIndex()};
 }
 
 std::pair<u32, u32> Swapchain::ReleaseQueues() const {
+    if (use_staging) {
+        return {VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED};
+    }
     return {instance.GetGraphicsQueueFamilyIndex(), VK_QUEUE_FAMILY_FOREIGN_EXT};
 }
 
@@ -129,6 +174,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
         }
     }
     const vk::Device device = instance.GetDevice();
+    staging_coherent = true;
     buffers.resize(image_count);
     image_acquired.resize(image_count);
     present_ready.resize(image_count);
@@ -138,14 +184,22 @@ void Swapchain::Create(u32 width_, u32 height_) {
         ASSERT_MSG(acquired_result == vk::Result::eSuccess, "Failed to create semaphore: {}",
                    vk::to_string(acquired_result));
         image_acquired[i] = acquired;
-        // The present-ready semaphore is exported as a sync file after its signal is submitted.
-        const vk::ExportSemaphoreCreateInfo export_info{
-            .handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
-        };
-        auto [ready_result, ready] = device.createSemaphore({.pNext = &export_info});
-        ASSERT_MSG(ready_result == vk::Result::eSuccess, "Failed to create exportable semaphore: {}",
-                   vk::to_string(ready_result));
-        present_ready[i] = ready;
+        if (use_staging) {
+            auto [ready_result, ready] = device.createSemaphore({});
+            ASSERT_MSG(ready_result == vk::Result::eSuccess,
+                       "Failed to create staging present_ready semaphore: {}",
+                       vk::to_string(ready_result));
+            present_ready[i] = ready;
+        } else {
+            // The present-ready semaphore is exported as a sync file after its signal is submitted.
+            const vk::ExportSemaphoreCreateInfo export_info{
+                .handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
+            };
+            auto [ready_result, ready] = device.createSemaphore({.pNext = &export_info});
+            ASSERT_MSG(ready_result == vk::Result::eSuccess, "Failed to create exportable semaphore: {}",
+                       vk::to_string(ready_result));
+            present_ready[i] = ready;
+        }
         SetObjectName(device, image_acquired[i], "AHB swapchain image_acquired {}", i);
         SetObjectName(device, present_ready[i], "AHB swapchain present_ready {}", i);
         free_queue.push_back(i);
@@ -168,11 +222,143 @@ void Swapchain::CreateBuffer(u32 index) {
         .height = height,
         .layers = 1,
         .format = AhbFormat,
-        .usage = AhbUsage,
+        .usage = use_staging ? AhbStagingUsage : AhbUsage,
     };
     const int allocated = AHardwareBuffer_allocate(&desc, &buffer.ahb);
     ASSERT_MSG(allocated == 0 && buffer.ahb, "AHardwareBuffer_allocate {}x{} failed: {}", width,
                height, allocated);
+
+    const auto memory_properties = instance.GetMemoryProperties();
+    if (use_staging) {
+        surface_format.format = vk::Format::eR8G8B8A8Unorm;
+        const vk::ImageUsageFlags usage =
+            vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst |
+            vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
+        capture_supported = capture_supported && bool(usage & vk::ImageUsageFlagBits::eTransferSrc);
+        const vk::ImageCreateInfo image_info{
+            .imageType = vk::ImageType::e2D,
+            .format = surface_format.format,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = usage,
+            .sharingMode = vk::SharingMode::eExclusive,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        };
+        auto [image_result, image] = device.createImage(image_info);
+        ASSERT_MSG(image_result == vk::Result::eSuccess, "Failed to create AHB staging image: {}",
+                   vk::to_string(image_result));
+        buffer.image = image;
+
+        const auto image_reqs = device.getImageMemoryRequirements(image);
+        u32 image_mem_type = ~0u;
+        for (u32 i = 0; i < memory_properties.memoryTypeCount; ++i) {
+            if (!(image_reqs.memoryTypeBits & (1u << i))) {
+                continue;
+            }
+            if (image_mem_type == ~0u) {
+                image_mem_type = i;
+            }
+            if (memory_properties.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+                image_mem_type = i;
+                break;
+            }
+        }
+        ASSERT_MSG(image_mem_type != ~0u, "No memory type for staging image (bits {:#x})",
+                   image_reqs.memoryTypeBits);
+        auto [mem_res, memory] = device.allocateMemory({
+            .allocationSize = image_reqs.size,
+            .memoryTypeIndex = image_mem_type,
+        });
+        ASSERT_MSG(mem_res == vk::Result::eSuccess, "Failed to allocate staging image memory: {}",
+                   vk::to_string(mem_res));
+        buffer.memory = memory;
+        const auto bind_res = device.bindImageMemory(image, memory, 0);
+        ASSERT_MSG(bind_res == vk::Result::eSuccess, "Failed to bind staging image: {}",
+                   vk::to_string(bind_res));
+
+        auto [view_result, view] = device.createImageView({
+            .image = image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = surface_format.format,
+            .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                 .levelCount = 1,
+                                 .layerCount = 1},
+        });
+        ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create staging image view: {}",
+                   vk::to_string(view_result));
+        buffer.view = view;
+        SetObjectName(device, image, "AHB swapchain image {}", index);
+        SetObjectName(device, view, "AHB swapchain view {}", index);
+
+        const vk::DeviceSize staging_size = static_cast<vk::DeviceSize>(width) * height * 4u;
+        auto [buf_res, staging_buf] = device.createBuffer({
+            .size = staging_size,
+            .usage = vk::BufferUsageFlagBits::eTransferDst,
+            .sharingMode = vk::SharingMode::eExclusive,
+        });
+        ASSERT_MSG(buf_res == vk::Result::eSuccess, "Failed to create AHB staging buffer: {}",
+                   vk::to_string(buf_res));
+        buffer.staging_buffer = staging_buf;
+
+        const auto buf_reqs = device.getBufferMemoryRequirements(staging_buf);
+        u32 staging_mem_type = ~0u;
+        bool coherent = false;
+        for (u32 i = 0; i < memory_properties.memoryTypeCount; ++i) {
+            if (!(buf_reqs.memoryTypeBits & (1u << i))) {
+                continue;
+            }
+            const auto flags = memory_properties.memoryTypes[i].propertyFlags;
+            if (!(flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+                continue;
+            }
+            if (staging_mem_type == ~0u) {
+                staging_mem_type = i;
+                coherent = bool(flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+            }
+            if (flags & vk::MemoryPropertyFlagBits::eHostCoherent) {
+                staging_mem_type = i;
+                coherent = true;
+                break;
+            }
+        }
+        ASSERT_MSG(staging_mem_type != ~0u, "No host-visible memory type for AHB staging buffer (bits {:#x})",
+                   buf_reqs.memoryTypeBits);
+        staging_coherent = staging_coherent && coherent;
+
+        auto [s_mem_res, s_mem] = device.allocateMemory({
+            .allocationSize = buf_reqs.size,
+            .memoryTypeIndex = staging_mem_type,
+        });
+        ASSERT_MSG(s_mem_res == vk::Result::eSuccess, "Failed to allocate AHB staging buffer memory: {}",
+                   vk::to_string(s_mem_res));
+        buffer.staging_memory = s_mem;
+        const auto s_bind_res = device.bindBufferMemory(staging_buf, s_mem, 0);
+        ASSERT_MSG(s_bind_res == vk::Result::eSuccess, "Failed to bind AHB staging buffer: {}",
+                   vk::to_string(s_bind_res));
+
+        auto [map_res, mapped] = device.mapMemory(s_mem, 0, VK_WHOLE_SIZE);
+        ASSERT_MSG(map_res == vk::Result::eSuccess && mapped, "Failed to map AHB staging buffer: {}",
+                   vk::to_string(map_res));
+        buffer.staging_mapped = mapped;
+
+        const vk::CommandBufferAllocateInfo cmd_alloc{
+            .commandPool = staging_cmd_pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1,
+        };
+        const auto cmd_res = device.allocateCommandBuffers(&cmd_alloc, &buffer.copy_cmd);
+        ASSERT_MSG(cmd_res == vk::Result::eSuccess, "Failed to allocate AHB copy command buffer: {}",
+                   vk::to_string(cmd_res));
+
+        auto [fence_res, fence] = device.createFence({});
+        ASSERT_MSG(fence_res == vk::Result::eSuccess, "Failed to create AHB copy fence: {}",
+                   vk::to_string(fence_res));
+        buffer.copy_fence = fence;
+        return;
+    }
 
     auto [props_result, props_chain] = device.getAndroidHardwareBufferPropertiesANDROID<
         vk::AndroidHardwareBufferPropertiesANDROID, vk::AndroidHardwareBufferFormatPropertiesANDROID>(
@@ -220,7 +406,6 @@ void Swapchain::CreateBuffer(u32 index) {
                vk::to_string(image_result));
     buffer.image = image;
 
-    const auto memory_properties = instance.GetPhysicalDevice().getMemoryProperties();
     u32 memory_type = ~0u;
     for (u32 i = 0; i < memory_properties.memoryTypeCount; ++i) {
         if (!(props.memoryTypeBits & (1u << i))) {
@@ -294,9 +479,31 @@ void Swapchain::Destroy() {
                     vk::to_string(wait_result));
     }
     for (Buffer& buffer : buffers) {
-        device.destroyImageView(buffer.view);
-        device.destroyImage(buffer.image);
-        device.freeMemory(buffer.memory);
+        if (buffer.copy_fence) {
+            device.destroyFence(buffer.copy_fence);
+        }
+        if (staging_cmd_pool && buffer.copy_cmd) {
+            device.freeCommandBuffers(staging_cmd_pool, 1, &buffer.copy_cmd);
+        }
+        if (buffer.staging_mapped && buffer.staging_memory) {
+            device.unmapMemory(buffer.staging_memory);
+            buffer.staging_mapped = nullptr;
+        }
+        if (buffer.staging_buffer) {
+            device.destroyBuffer(buffer.staging_buffer);
+        }
+        if (buffer.staging_memory) {
+            device.freeMemory(buffer.staging_memory);
+        }
+        if (buffer.view) {
+            device.destroyImageView(buffer.view);
+        }
+        if (buffer.image) {
+            device.destroyImage(buffer.image);
+        }
+        if (buffer.memory) {
+            device.freeMemory(buffer.memory);
+        }
         // The app and the compositor keep the memory while they use it (reference counted).
         if (buffer.ahb) {
             AHardwareBuffer_release(buffer.ahb);
@@ -388,6 +595,13 @@ void Swapchain::ImportAcquire(u32 index) {
         return; // never shown, or released at once: nothing to wait for
     }
     buffer.release_fd = -1;
+    if (use_staging) {
+        while (!WaitSyncFile(fd, 1000)) {
+            LOG_WARNING(Render_Vulkan, "AHB swapchain: release fence of buffer {} still pending", index);
+        }
+        close(fd);
+        return;
+    }
     if (sync_import_ok) {
         const vk::ImportSemaphoreFdInfoKHR import_info{
             .semaphore = image_acquired[index],
@@ -435,8 +649,147 @@ int Swapchain::ExportPresentReady() {
     return fd; // -1 is possible too: the semaphore was already signaled
 }
 
+void Swapchain::StageAndCopyToAhb(u32 index) {
+    const IssBionicPerf::Scope timer{IssBionicPerf::Stage::AhbExport};
+    const vk::Device device = instance.GetDevice();
+    Buffer& buffer = buffers[index];
+
+    const auto reset_cmd_res = buffer.copy_cmd.reset();
+    ASSERT_MSG(reset_cmd_res == vk::Result::eSuccess, "Failed to reset AHB copy command buffer: {}",
+               vk::to_string(reset_cmd_res));
+    const auto begin_res = buffer.copy_cmd.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    });
+    ASSERT_MSG(begin_res == vk::Result::eSuccess, "Failed to begin AHB copy command buffer: {}",
+               vk::to_string(begin_res));
+
+    const vk::ImageSubresourceRange color_range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    const vk::ImageMemoryBarrier pre_barrier{
+        .srcAccessMask = {},
+        .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+        .oldLayout = PresentLayout(),
+        .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = buffer.image,
+        .subresourceRange = color_range,
+    };
+    buffer.copy_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                    vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, pre_barrier);
+
+    const vk::BufferImageCopy region{
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {width, height, 1},
+    };
+    buffer.copy_cmd.copyImageToBuffer(buffer.image, vk::ImageLayout::eTransferSrcOptimal,
+                                      buffer.staging_buffer, region);
+
+    const vk::BufferMemoryBarrier buf_barrier{
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eHostRead,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer.staging_buffer,
+        .offset = 0,
+        .size = VK_WHOLE_SIZE,
+    };
+    const vk::ImageMemoryBarrier post_barrier{
+        .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+        .dstAccessMask = {},
+        .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .newLayout = PresentLayout(),
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = buffer.image,
+        .subresourceRange = color_range,
+    };
+    buffer.copy_cmd.pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eHost, {}, {},
+        buf_barrier, post_barrier);
+
+    const auto end_res = buffer.copy_cmd.end();
+    ASSERT_MSG(end_res == vk::Result::eSuccess, "Failed to end AHB copy command buffer: {}",
+               vk::to_string(end_res));
+
+    const auto reset_fence_res = device.resetFences(buffer.copy_fence);
+    ASSERT_MSG(reset_fence_res == vk::Result::eSuccess, "Failed to reset AHB copy fence: {}",
+               vk::to_string(reset_fence_res));
+
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+    const vk::SubmitInfo submit_info{
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &present_ready[index],
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &buffer.copy_cmd,
+    };
+    const auto submit_res = instance.GetGraphicsQueue().submit(submit_info, buffer.copy_fence);
+    ASSERT_MSG(submit_res == vk::Result::eSuccess, "Failed to submit AHB staging copy: {}",
+               vk::to_string(submit_res));
+
+    vk::Result wait_res{};
+    while ((wait_res = device.waitForFences(buffer.copy_fence, true,
+                                            std::numeric_limits<u64>::max())) !=
+           vk::Result::eSuccess) {
+        ASSERT_MSG(wait_res == vk::Result::eTimeout, "AHB staging fence wait failed: {}",
+                   vk::to_string(wait_res));
+    }
+
+    if (!staging_coherent) {
+        const vk::MappedMemoryRange range{
+            .memory = buffer.staging_memory,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        const auto inv_res = device.invalidateMappedMemoryRanges(range);
+        ASSERT_MSG(inv_res == vk::Result::eSuccess,
+                   "AHB staging invalidateMappedMemoryRanges failed: {}", vk::to_string(inv_res));
+    }
+
+    AHardwareBuffer_Desc ahb_desc{};
+    AHardwareBuffer_describe(buffer.ahb, &ahb_desc);
+    void* ahb_ptr = nullptr;
+    const int lock_res = AHardwareBuffer_lock(
+        buffer.ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &ahb_ptr);
+    if (lock_res == 0 && ahb_ptr) {
+        const u8* src = static_cast<const u8*>(buffer.staging_mapped);
+        u8* dst = static_cast<u8*>(ahb_ptr);
+        const size_t row_bytes = static_cast<size_t>(width) * 4u;
+        const u32 dst_stride_pixels = ahb_desc.stride >= width ? ahb_desc.stride : width;
+        const size_t dst_stride_bytes = static_cast<size_t>(dst_stride_pixels) * 4u;
+        if (dst_stride_bytes == row_bytes) {
+            std::memcpy(dst, src, row_bytes * height);
+        } else {
+            for (u32 y = 0; y < height; ++y) {
+                std::memcpy(dst + static_cast<size_t>(y) * dst_stride_bytes,
+                            src + static_cast<size_t>(y) * row_bytes, row_bytes);
+            }
+        }
+        const int unlock_res = AHardwareBuffer_unlock(buffer.ahb, nullptr);
+        if (unlock_res != 0) {
+            LOG_WARNING(Render_Vulkan, "AHardwareBuffer_unlock failed: {}", unlock_res);
+        }
+    } else {
+        LOG_ERROR(Render_Vulkan, "AHardwareBuffer_lock failed: {}", lock_res);
+    }
+}
+
 bool Swapchain::Present() {
-    const int fence_fd = ExportPresentReady();
+    if (use_staging && !buffers.empty()) {
+        StageAndCopyToAhb(image_index);
+    }
+    const int fence_fd = use_staging ? -1 : ExportPresentReady();
     ++frame_counter;
     const int trace_index = std::exchange(capture_index, -1);
     if (trace_index >= 0) {

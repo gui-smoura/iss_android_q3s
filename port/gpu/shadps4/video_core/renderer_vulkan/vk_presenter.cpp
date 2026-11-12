@@ -1344,7 +1344,10 @@ bool Presenter::PresentWithLsfg(Frame* frame) {
         scheduler.Flush(info);
         // Preserve Daedalus Bionic sync-fd submission semantics; no CPU-side
         // completion wait here (unlike upstream's older path).
-        swapchain.Present();
+        {
+            std::scoped_lock submit_lock{Scheduler::submit_mutex};
+            swapchain.Present();
+        }
         ++handed;
     }
     if (swapchain.Generation() != buffer_set) {
@@ -1385,12 +1388,8 @@ Frame* Presenter::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
-        }
+        ASSERT_MSG(result == vk::Result::eTimeout,
+                   "Failed waiting for frame present fence: {}", vk::to_string(result));
     }
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
