@@ -102,7 +102,7 @@ public final class BionicMainActivity extends Activity {
     e.put("ISS_BIONIC_DRIVER",BionicDriverSettings.selection(this));
     e.put("ISS_CUSTOM_DRIVER",BionicDriverSettings.customLibrary(this).getPath());
     BionicRendererSettings.environment(getSharedPreferences("iss",0),e);
-    Process proc=pb.start();
+    java.lang.Process proc=pb.start();
     try(InputStream in=proc.getInputStream();OutputStream out=new FileOutputStream(new File(filesDir,"iss.log"),false)){
      byte[] buf=new byte[8192];int n;while((n=in.read(buf))>0)out.write(buf,0,n);
     }
