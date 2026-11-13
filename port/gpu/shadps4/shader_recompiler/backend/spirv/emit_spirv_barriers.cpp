@@ -27,6 +27,13 @@ void EmitBarrier(EmitContext& ctx) {
         memory = spv::Scope::Workgroup;
         memory_semantics =
             spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::WorkgroupMemory;
+        // iss: LDS moved to a storage buffer (SharedMemoryToStoragePass) is UniformMemory.
+        for (const auto& buffer : ctx.info.buffers) {
+            if (buffer.buffer_type == BufferType::SharedMemory) {
+                memory_semantics |= spv::MemorySemanticsMask::UniformMemory;
+                break;
+            }
+        }
     }
     ctx.OpControlBarrier(ctx.ConstU32(static_cast<u32>(execution)),
                          ctx.ConstU32(static_cast<u32>(memory)),

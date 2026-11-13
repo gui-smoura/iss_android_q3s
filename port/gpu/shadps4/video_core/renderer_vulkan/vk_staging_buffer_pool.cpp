@@ -30,7 +30,7 @@ namespace {
 constexpr u64 RING_IDLE_FRAMES = 300;
 constexpr u64 LARGE_IDLE_FRAMES = 300;
 constexpr u64 PREWARM_BLOCKS = 2;
-constexpr u64 DEFAULT_STAGING_KEEP_MB = 128;
+constexpr u64 DEFAULT_STAGING_KEEP_MB = 64;
 #else
 constexpr u64 RING_IDLE_FRAMES = 3000;
 constexpr u64 LARGE_IDLE_FRAMES = 3000;

@@ -317,7 +317,11 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     // Preserve FEX's default TSO barriers for guest threading correctness.
     const bool dynamic_l1 = [] {
         const char* value = std::getenv("ISS_FEX_DYNAMIC_L1");
+#ifdef __ANDROID__
+        return !(value && value[0] == '0');
+#else
         return value && value[0] == '1';
+#endif
     }();
     FEXCore::Config::Set(FEXCore::Config::CONFIG_DYNAMICL1CACHE,
                          dynamic_l1 ? "1" : "0");

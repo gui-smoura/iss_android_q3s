@@ -219,6 +219,10 @@ final class LanguageCatalog {
   {"FSR Quality","FSR Calidad","FSR Qualité","FSR Qualität","FSR Qualità","FSR Качество","FSR 高画質","FSR 고품질","FSR 质量"},
   {"FSR Balanced","FSR Equilibrado","FSR Équilibré","FSR Ausgeglichen","FSR Bilanciato","FSR Баланс","FSR バランス","FSR 균형","FSR 平衡"},
   {"FSR Performance","FSR Rendimiento","FSR Performance","FSR Leistung","FSR Prestazioni","FSR Производительность","FSR パフォーマンス","FSR 성능","FSR 性能"},
+  {"Precompile shaders","Precompilar shaders","Précompiler les shaders","Shader vorkompilieren","Precompila shader","Предкомпиляция шейдеров","シェーダーを事前コンパイル","셰이더 사전 컴파일","预编译着色器"},
+  {"Precompiling shaders on selected driver…","Precompilando shaders en el controlador seleccionado…","Précompilation des shaders sur le pilote sélectionné…","Shader werden auf dem ausgewählten Treiber vorkompiliert…","Precompilazione shader sul driver selezionato…","Предкомпиляция шейдеров на выбранном драйвере…","選択したドライバーでシェーダーを事前コンパイル中…","선택한 드라이버에서 셰이더 사전 컴파일 중…","正在所选驱动上预编译着色器…"},
+  {"Shader precompilation finished.","Precompilación de shaders completada.","Précompilation des shaders terminée.","Shader-Vorkompilierung abgeschlossen.","Precompilazione shader completata.","Предкомпиляция шейдеров завершена.","シェーダーの事前コンパイルが完了しました。","셰이더 사전 컴파일이 완료되었습니다.","着色器预编译已完成。"},
+  {"Shader precompilation exited (","La precompilación de shaders terminó (","La précompilation des shaders s'est terminée (","Shader-Vorkompilierung beendet (","Precompilazione shader terminata (","Предкомпиляция шейдеров завершилась (","シェーダーの事前コンパイルが終了しました (","셰이더 사전 컴파일 종료 (","着色器预编译已退出 ("},
 
  };
  static String text(String language,String english){

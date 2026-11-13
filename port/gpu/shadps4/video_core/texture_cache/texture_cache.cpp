@@ -26,6 +26,12 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 #include <vulkan/vulkan_format_traits.hpp>
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+#include <sys/mman.h>
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+#endif
 
 namespace VideoCore {
 
@@ -51,6 +57,17 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     critical_gc_samplers = max_samplers * 15 / 16;
 
     // Set up garbage collection parameters.
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+    {
+        const char* env = std::getenv("ISS_GC_IMAGES_ONLY");
+        if (!(env && env[0] == '0')) {
+            trigger_gc_memory = 192_MB;
+            pressure_gc_memory = 256_MB;
+            critical_gc_memory = 384_MB;
+            return;
+        }
+    }
+#endif
     if (!instance.CanReportMemoryUsage()) {
 #if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
         trigger_gc_memory = 512_MB;
@@ -1440,6 +1457,31 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(desc.view_info, false);
 }
 
+namespace {
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+void ScheduleGuestTexturePageout(Vulkan::Scheduler& scheduler, const Image& image) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("ISS_TEXTURE_PAGEOUT");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || True(image.flags & ImageFlagBits::GpuModified) ||
+        image.info.props.is_depth || image.info.guest_size < 64_KB) {
+        return;
+    }
+    const uintptr_t aligned_start = (image.info.guest_address + 4095ULL) & ~uintptr_t{4095};
+    const uintptr_t aligned_end =
+        (image.info.guest_address + image.info.guest_size) & ~uintptr_t{4095};
+    if (aligned_end <= aligned_start) {
+        return;
+    }
+    const size_t len = static_cast<size_t>(aligned_end - aligned_start);
+    scheduler.DeferOperation([ptr = reinterpret_cast<void*>(aligned_start), len] {
+        ::madvise(ptr, len, MADV_PAGEOUT);
+    });
+}
+#endif
+} // namespace
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.guest_samples > 1) {
         return;
@@ -1473,10 +1515,19 @@ void TextureCache::RefreshImage(Image& image) {
     TlgStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
     if (image.info.props.is_bc_decoded) {
         UploadDecodedImage(image);
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+        ScheduleGuestTexturePageout(scheduler, image);
+#endif
         return;
     }
+    static const bool drop_mip0_env = [] {
+        const char* env = std::getenv("TLG_DROP_MIP0");
+        return env && env[0] == '1';
+    }();
+    const bool skip_mip0 = drop_mip0_env && num_mips > 1 && image.info.props.is_block &&
+                           !is_gpu_modified && !image.info.props.is_depth;
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
-    for (u32 m = 0; m < num_mips; m++) {
+    for (u32 m = skip_mip0 ? 1u : 0u; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
         const u32 height = std::max(image.info.size.height >> m, 1u);
         const u32 depth =
@@ -1525,6 +1576,9 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+    ScheduleGuestTexturePageout(scheduler, image);
+#endif
 }
 
 void TextureCache::UploadDecodedImage(Image& image) {
@@ -1814,6 +1868,20 @@ void TextureCache::GarbageCollectImages() {
         const char* env = std::getenv("TLG_GC_BUDGET_MB");
         return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
     }();
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+    static const bool images_only_gc = [] {
+        const char* env = std::getenv("ISS_GC_IMAGES_ONLY");
+        return !(env && env[0] == '0');
+    }();
+    if (images_only_gc) {
+        // Keep total_used_memory strictly from RegisterImage/UnregisterImage instead of
+        // driver-wide heap usage (which includes GiB of sparse buffer residency).
+        const u64 budget = forced_budget ? forced_budget : 384_MB;
+        trigger_gc_memory = budget / 2;
+        pressure_gc_memory = (budget * 2) / 3;
+        critical_gc_memory = budget;
+    } else
+#endif
     if (instance.CanReportMemoryUsage()) {
         const auto memory_budget = instance.GetMemoryBudgetSnapshot();
         total_used_memory = memory_budget.usage;

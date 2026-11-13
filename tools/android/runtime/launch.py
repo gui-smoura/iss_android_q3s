@@ -131,6 +131,14 @@ def main():
         subprocess.run([*command, str(name), *map(str, arguments)], check=True, env=env)
         print(f"ISS preparation complete: {script}", flush=True)
 
+    if env.get("ISS_WARMUP_ONLY") == "1" or "--warmup-only" in sys.argv[1:]:
+        args = ([str(probe)] if bionic else [str(loader), str(probe)]) + [
+            "--warmup-only", "--app0", str(game), "--user", str(user), "--timeout", "0"]
+        print("ISS warmup-only mode; precompiling cached shaders without starting FEX", flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execve(str(probe) if bionic else str(loader), args, env)
+
     run_step("prepare", game, "--out", out)
     # link_modules uses boot.bin directly; link_libc is not a prerequisite.
     run_step("link_modules", game, "--out", out)

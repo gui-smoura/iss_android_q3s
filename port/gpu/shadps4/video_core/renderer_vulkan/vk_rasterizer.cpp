@@ -2878,9 +2878,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = CsRegs();
-                const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
+                // iss: indirect dispatches leave dim_x/y/z at 0 and a large grid would not fit
+                // the stream buffer (Map returns nullptr): use a bounded size instead.
+                constexpr u64 MaxLdsBufferSize = 64ULL << 20;
+                u64 lds_size = u64{cs_program.SharedMemSize()} * cs_program.NumWorkgroups();
+                if (lds_size == 0 || lds_size > MaxLdsBufferSize) {
+                    lds_size = MaxLdsBufferSize;
+                }
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
-                std::memset(data, 0, lds_size);
+                if (data) {
+                    std::memset(data, 0, lds_size);
+                }
                 lds_buffer.Commit();
                 buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
             } else {

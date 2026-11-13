@@ -855,8 +855,13 @@ void Instance::CreateAllocator() {
     };
 
     const VkDeviceSize block_size = [] {
-        const char* value=std::getenv("ISS_VMA_BLOCK_MB");
-        return VkDeviceSize(value ? std::clamp(std::atoi(value),0,256) : 64) << 20;
+        const char* value = std::getenv("ISS_VMA_BLOCK_MB");
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+        constexpr int default_mb = 32;
+#else
+        constexpr int default_mb = 64;
+#endif
+        return VkDeviceSize(value ? std::clamp(std::atoi(value), 0, 256) : default_mb) << 20;
     }();
     const VmaAllocatorCreateInfo allocator_info = {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,

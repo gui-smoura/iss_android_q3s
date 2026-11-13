@@ -71,4 +71,9 @@ export ISS_LSFG_STATE_FILE="$base/framegen.state"
 export ISS_LSFG_LIB="$runtime/lib/libbloodframe.so"
 export ISS_LSFG_DLL="$base/Lossless.dll"
 
+if [ "${1:-}" = "--warmup-only" ] || [ "${ISS_WARMUP_ONLY:-0}" = "1" ]; then
+ echo "ISS Android Bionic: running standalone shader precompilation (--warmup-only)"
+ exec "$probe" --warmup-only --app0 "$TLG_GAME_DIR" --user "$base/user" --timeout 0
+fi
+
 exec "$python" "$base/launch.py"

@@ -66,7 +66,7 @@ public final class BionicMainActivity extends Activity {
    LinearLayout driver=card(content,AppLanguage.text("Vulkan driver","Driver Vulkan"));BionicDriverSettings.add(this,driver);
    LinearLayout display=card(content,AppLanguage.text("HUD AND CONTROLS", "HUD E CONTROLES"));File hud=new File(getFilesDir(),"issport/hud.ini");hud.getParentFile().mkdirs();HudConfig.migrateLegacy(this,hud);button(display,"HUD — FPS / GPU / CPU",()->HudControls.show(this,hud,null));button(display,AppLanguage.text("Controls and D-pad swipes", "Controles e swipe pelo D-pad"),()->BionicPlayerMenu.controlSettings(this,null,null));
    LinearLayout saves=card(content,AppLanguage.text("Saves","Salvamentos"));saves.addView(label(AppLanguage.text("Import or export saves with the game closed.", "Importe ou exporte seus salvamentos com o jogo fechado."),14,0xffc7aba8));button(saves,AppLanguage.text("Export saves (ZIP)", "Exportar salvamentos (ZIP)"),()->chooseSave(false));button(saves,AppLanguage.text("Import saves (ZIP)", "Importar salvamentos (ZIP)"),()->chooseSave(true));
-   LinearLayout logs=card(content,AppLanguage.text("LOGS","REGISTROS"));button(logs,AppLanguage.text("Export latest log", "Exportar último log"),()->startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain").putExtra(Intent.EXTRA_TITLE,"iss-android.log"),3));button(logs,AppLanguage.text("Clear shader cache", "Limpar cache de shaders"),this::clearShaderCache);
+   LinearLayout logs=card(content,AppLanguage.text("LOGS","REGISTROS"));button(logs,AppLanguage.text("Export latest log", "Exportar último log"),()->startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain").putExtra(Intent.EXTRA_TITLE,"iss-android.log"),3));button(logs,AppLanguage.text("Precompile shaders", "Pré-compilar Shaders"),this::precompileShaders);button(logs,AppLanguage.text("Clear shader cache", "Limpar cache de shaders"),this::clearShaderCache);
    LinearLayout fg=card(content,"LOSSLESS.DLL · BLOODFRAME");button(fg,AppLanguage.text("Import Lossless.dll", "Importar Lossless.dll"),()->FramegenSettings.chooseDll(this));
   }else{
    LinearLayout about=card(content,"inFAMOUS SECOND SON — DAEDALUS FORK");about.addView(label(AppLanguage.text("Version","Versão")+" 0.2\n"+AppLanguage.text("Android port with a Bionic runtime.","Port para Android com runtime Bionic.")+"\n\n"+AppLanguage.text("Fork and modifications:","Fork e modificações:")+" erickmendes22\nDaedalus Emulator\n\n"+AppLanguage.text("Base project:","Projeto base:")+" HayatoG/iss_pc\n\n"+AppLanguage.text("No game files are included.","Nenhum arquivo do jogo está incluído."),17,0xfffff1e9));button(about,"YouTube · @daedalusemulator",()->startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse("https://www.youtube.com/@daedalusemulator"))));button(about,"GitHub · iss_android",()->startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse("https://github.com/erickmendes22/iss_android"))));
@@ -81,6 +81,42 @@ public final class BionicMainActivity extends Activity {
    deleteTree(new File(getFilesDir(),"issport/user/cache"));
    status.setText(AppLanguage.text("Shader and pipeline cache cleared.", "Cache de shaders e pipelines limpo."));
   }catch(Exception e){status.setText(e.getMessage());}
+ }
+ private void precompileShaders(){
+  if(busy)return;
+  if(!access()||!gameReady()){beginSetup(true);return;}
+  String path=getSharedPreferences("iss",0).getString("game_dir","");
+  setBusy(true);
+  status.setText(AppLanguage.text("Precompiling shaders on selected driver…", "Pré-compilando shaders no driver selecionado…"));
+  new Thread(()->{
+   try(BionicSession.Guard ignored=BionicSession.acquire(getFilesDir())){
+    BionicRuntimeInstaller.install(this);
+    File filesDir=getFilesDir();
+    File baseDir=new File(filesDir,"issport");
+    ProcessBuilder pb=new ProcessBuilder("/system/bin/sh",new File(baseDir,"run-bionic.sh").getPath(),"--warmup-only").redirectErrorStream(true);
+    java.util.Map<String,String> e=pb.environment();
+    e.put("FXD_FILES",filesDir.getPath());
+    e.put("ISS_GAME_DIR",path);
+    e.put("ISS_BIONIC","1");
+    e.put("ISS_WARMUP_ONLY","1");
+    e.put("ISS_BIONIC_DRIVER",BionicDriverSettings.selection(this));
+    e.put("ISS_CUSTOM_DRIVER",BionicDriverSettings.customLibrary(this).getPath());
+    BionicRendererSettings.environment(getSharedPreferences("iss",0),e);
+    Process proc=pb.start();
+    try(InputStream in=proc.getInputStream();OutputStream out=new FileOutputStream(new File(filesDir,"iss.log"),false)){
+     byte[] buf=new byte[8192];int n;while((n=in.read(buf))>0)out.write(buf,0,n);
+    }
+    int code=proc.waitFor();
+    runOnUiThread(()->{
+     setBusy(false);
+     status.setText(code==0
+      ? AppLanguage.text("Shader precompilation finished.", "Pré-compilação de shaders concluída.")
+      : AppLanguage.text("Shader precompilation exited (", "Pré-compilação de shaders encerrou (")+code+AppLanguage.text("). Export log.", "). Exporte o log."));
+    });
+   }catch(Exception ex){
+    runOnUiThread(()->{setBusy(false);status.setText(ex.toString());});
+   }
+  },"shader-warmup").start();
  }
 
  @Override protected void onSaveInstanceState(Bundle out){super.onSaveInstanceState(out);out.putInt("page",selectedPage);out.putInt("pending_setup",pendingSetup);out.putBoolean("requesting_access",requestingAccess);out.putBoolean("waiting_settings",waitingForSettings);}

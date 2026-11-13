@@ -46,7 +46,7 @@ int main() {
         assert(DefaultWorkerCount()==(bionic ? 0u : std::clamp(cores/2,1u,8u)));
         assert(Rasterizer::DrawPipeWanted()==(!bionic && cores>=8));
         auto [compile,capture]=Budget();
-        assert(compile==(bionic ? 2u : std::clamp(cores/2,1u,6u)));
+        assert(compile==(bionic ? 1u : std::clamp(cores/2,1u,6u)));
         assert(capture==(bionic ? 1u : std::min(2u,std::max(1u,cores/4))));
     }
     setenv("TLG_PREP_WORKERS","4",1);assert(DefaultWorkerCount()==4);
@@ -61,7 +61,7 @@ int main() {
     }
     for(const char* value : {"0","7","-1","","2junk"}) {
         setenv("TLG_GPU_COMPILER_WORKERS",value,1);
-        assert(Budget().first==(bionic ? 2u : 4u));
+        assert(Budget().first==(bionic ? 1u : 4u));
     }
 }
 '''

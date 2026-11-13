@@ -397,6 +397,18 @@ int main(int argc, char** argv) {
         self.assertIn("vk::DriverId::eQualcommProprietary", compute_cpp)
         self.assertIn("vk::PipelineCreateFlagBits::eDisableOptimization", compute_cpp)
         self.assertIn("ISS_QCOM_CS_OPT", compute_cpp)
+        self.assertIn("ISS_QCOM_CS_NOOP_FALLBACK", compute_cpp)
+        self.assertIn("noop_spirv", compute_cpp)
+
+        self.assertIn("bool needs_shared_atomics_to_storage{};", profile_h)
+        self.assertIn(".needs_shared_atomics_to_storage =", cache_cpp)
+        self.assertIn("ISS_QCOM_LDS_TO_SSBO", cache_cpp)
+
+        lds_pass_cpp = (
+            ROOT / "port/gpu/shadps4/shader_recompiler/ir/passes/shared_memory_to_storage_pass.cpp"
+        ).read_text()
+        self.assertIn("profile.needs_shared_atomics_to_storage", lds_pass_cpp)
+        self.assertIn("HasSharedAtomics(program)", lds_pass_cpp)
 
         spirv_ctx_cpp = (
             ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/spirv_emit_context.cpp"
@@ -406,7 +418,22 @@ int main(int argc, char** argv) {
         ser_cpp = (
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
         ).read_text()
-        self.assertIn("ShaderBinaryVersion = 15u;", ser_cpp)
+        self.assertIn("ShaderBinaryVersion = 16u;", ser_cpp)
+
+        mem_c = (ROOT / "port/src/runtime_memory.c").read_text()
+        self.assertIn("ISS_DIRECT_MEM_MB", mem_c)
+        self.assertIn("direct_mem.bin", mem_c)
+        self.assertIn("unlink(path);", mem_c)
+
+        probe_c = (ROOT / "port/src/probe.c").read_text()
+        self.assertIn("--warmup-only", probe_c)
+        self.assertIn("tlggpu_warmup_only(&gpu)", probe_c)
+
+        main_java = (
+            ROOT / "android/app/src/ro/cobrabm/fexdroid/BionicMainActivity.java"
+        ).read_text()
+        self.assertIn("Pré-compilar Shaders", main_java)
+        self.assertIn("precompileShaders", main_java)
 
         # QGL segfaults on ANY @llvm.qgpu.atomic.*.oob.p3i32.i32 intrinsic on Workgroup memory.
         self.assertNotIn("ctx.OpAtomicLoad(", atomic_cpp)

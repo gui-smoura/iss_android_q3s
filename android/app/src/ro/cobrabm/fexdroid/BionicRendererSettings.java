@@ -35,7 +35,7 @@ final class BionicRendererSettings {
   env.put("TLG_DYNAMIC_STRIDE",p.getBoolean("renderer_dynamic_stride",true)?"1":"0");
   env.put("TLG_OCCLUSION_MODE",p.getBoolean("renderer_real_occlusion",true)?"4":"3");
   env.put("TLG_GC_BATCH_DOWNLOAD",p.getBoolean("renderer_batch_gc",true)?"1":"0");
-  env.put("ISS_VMA_BLOCK_MB",p.getBoolean("renderer_small_blocks",true)?"64":"0");
+  env.put("ISS_VMA_BLOCK_MB",p.getBoolean("renderer_small_blocks",true)?"32":"0");
   // Vulkan recording fast paths. Compare same scene and driver with these OFF/ON.
   env.put("ISS_STAGE_BIND_MEMO",p.getBoolean("renderer_stage_bind_memo",true)?"1":"0");
   env.put("ISS_FAST_PIPELINE_BIND",p.getBoolean("renderer_fast_pipeline_bind",true)?"1":"0");

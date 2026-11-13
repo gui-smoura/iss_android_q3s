@@ -301,6 +301,10 @@ final class LanguageCatalogTrPl {
   {"Vulkan secondary passes: depth only (experimental)","Vulkan ikincil geçişleri: yalnızca derinlik (deneysel)","Dodatkowe przebiegi Vulkan: tylko głębia (eksperymentalne)"},
   {"Clear shader cache","Gölgelendirici önbelleğini temizle","Wyczyść pamięć podręczną shaderów"},
   {"Shader and pipeline cache cleared.","Gölgelendirici ve işlem hattı önbelleği temizlendi.","Wyczyszczono pamięć podręczną shaderów i potoków."},
+  {"Precompile shaders","Gölgelendiricileri önceden derle","Wstępnie kompiluj shadery"},
+  {"Precompiling shaders on selected driver…","Seçili sürücüde gölgelendiriciler önceden derleniyor…","Wstępna kompilacja shaderów na wybranym sterowniku…"},
+  {"Shader precompilation finished.","Gölgelendirici ön derlemesi tamamlandı.","Wstępna kompilacja shaderów zakończona."},
+  {"Shader precompilation exited (","Gölgelendirici ön derlemesi çıkış yaptı (","Wstępna kompilacja shaderów zakończyła się ("},
   {"Invalid driver library name","Geçersiz sürücü kitaplığı adı","Nieprawidłowa nazwa biblioteki sterownika"},
   {"Driver ZIP is missing meta.json or a .so library","Sürücü ZIP'inde meta.json veya .so kitaplığı yok","W ZIP sterownika brakuje meta.json lub biblioteki .so"},
   };

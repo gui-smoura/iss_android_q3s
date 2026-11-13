@@ -68,6 +68,10 @@ struct Profile {
     /// Lower Workgroup (LDS) integer atomic min/max to an OpAtomicCompareExchange loop to avoid
     /// Qualcomm proprietary driver (libllvm-qgl.so) SIGSEGV on @llvm.qgpu.atomic.imax.oob.p3i32.
     bool needs_shared_atomic_minmax_cas{};
+    /// iss: move the LDS of compute shaders that use shared atomics to a storage buffer
+    /// (SharedMemoryToStoragePass): Qualcomm libllvm-qgl.so crashes on every Workgroup atomic,
+    /// and the non-atomic lowering races between invocations.
+    bool needs_shared_atomics_to_storage{};
 
     bool operator==(const Profile&) const = default;
 };

@@ -639,11 +639,33 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .block1d_as_2d = AmdGpu::Block1DAs2D(),
         .bc_tiny_decode = AmdGpu::BcTinyDecode(),
         .fragment_contraction_policy = Shader::Backend::SPIRV::FragmentContractionEnabled(),
+        // iss: compute shaders with LDS atomics get their LDS as a storage buffer with native
+        // buffer atomics on Qualcomm; the non-atomic CAS fallback only stays on by default if
+        // LDS-to-SSBO is explicitly disabled via ISS_QCOM_LDS_TO_SSBO=0 / TLG_LDS_TO_SSBO=0.
         .needs_shared_atomic_minmax_cas = [&] {
             if (const char* env = std::getenv("TLG_LDS_ATOMIC_CAS")) {
                 return env[0] != '0';
             }
             if (const char* env = std::getenv("ISS_LDS_ATOMIC_CAS")) {
+                return env[0] != '0';
+            }
+            const bool lds_to_ssbo = [&] {
+                if (const char* env = std::getenv("TLG_LDS_TO_SSBO")) {
+                    return env[0] != '0';
+                }
+                if (const char* env = std::getenv("ISS_QCOM_LDS_TO_SSBO")) {
+                    return env[0] != '0';
+                }
+                return instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
+            }();
+            return !lds_to_ssbo &&
+                   instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
+        }(),
+        .needs_shared_atomics_to_storage = [&] {
+            if (const char* env = std::getenv("TLG_LDS_TO_SSBO")) {
+                return env[0] != '0';
+            }
+            if (const char* env = std::getenv("ISS_QCOM_LDS_TO_SSBO")) {
                 return env[0] != '0';
             }
             return instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
@@ -661,6 +683,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 profile.fragment_contraction_policy ? "on" : "off");
     std::printf("GPU: LDS atomic min/max CAS lowering %s\n",
                 profile.needs_shared_atomic_minmax_cas ? "on" : "off");
+    std::printf("GPU: LDS atomics to storage buffer %s\n",
+                profile.needs_shared_atomics_to_storage ? "on" : "off");
 
 
     // tlg: BP08, start from the driver blob saved by an earlier session (same GPU and driver).
@@ -690,9 +714,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 #else
         constexpr bool native_bionic = false;
 #endif
-        // GoW3 Bionic's mobile CPU budget: leave more execution time for FEX and
-        // command recording during shader misses, while retaining async compilation.
-        auto count = native_bionic ? 2u : std::clamp(TlgThreads::Available() / 2, 1u, 6u);
+        // Mobile memory/CPU budget: keep 1 async shader compiler worker on Bionic to avoid
+        // spiking peak compiler RAM alongside FEX and guest asset streaming.
+        auto count = native_bionic ? 1u : std::clamp(TlgThreads::Available() / 2, 1u, 6u);
         const auto capture_count = native_bionic ? 1u :
             std::min(2u, std::max(1u, TlgThreads::Available() / 4));
         if (const char* requested = std::getenv("TLG_GPU_COMPILER_WORKERS")) {

@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #include <boost/container/small_vector.hpp>
 
@@ -105,12 +108,23 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     }();
     const bool disable_cs_opt =
         force_disable_qcom_cs_opt && instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
+    // Quest 3S: libllvm-qgl.so rejects a few shaders with ErrorUnknown (cs_0x00000000ce1675e0),
+    // even after the retries. Instead of ending the game, try again without
+    // eDisableOptimization, then without the required subgroup size, and as a last resort bind
+    // an empty compute shader (same layout) so that dispatch does nothing.
+    // ISS_QCOM_CS_NOOP_FALLBACK=0 keeps the old assert.
+    static const bool qcom_noop_fallback_env = [] {
+        const char* env = std::getenv("ISS_QCOM_CS_NOOP_FALLBACK");
+        return !(env && env[0] == '0');
+    }();
+    const bool qcom_fallback =
+        qcom_noop_fallback_env && instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
 
     // Runs on the compiler threads too: it only uses what stays fixed after construction and
     // the layout, which the destructor keeps alive until the build is done. Returns no pipeline
     // when one may only come from the driver's cache and it isn't there.
     const auto create = [&instance, module, layout = *pipeline_layout, debug_str,
-                         disable_cs_opt](vk::PipelineCache cache,
+                         disable_cs_opt, qcom_fallback](vk::PipelineCache cache,
                                          vk::PipelineCreateFlags flags) -> vk::UniquePipeline {
         const auto effective_flags =
             disable_cs_opt ? (flags | vk::PipelineCreateFlagBits::eDisableOptimization) : flags;
@@ -132,6 +146,74 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         for (u32 attempt = 1;
              RetryPipelineCreation(created.result, attempt, "compute", debug_str); ++attempt) {
             created = device.createComputePipelineUnique(cache, compute_pipeline_ci);
+        }
+        const bool cache_probe_miss =
+            created.result == vk::Result::ePipelineCompileRequired &&
+            (effective_flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
+        if (qcom_fallback && !cache_probe_miss && created.result != vk::Result::eSuccess) {
+            const vk::Result first_error = created.result;
+            if (disable_cs_opt) {
+                auto relaxed_ci = compute_pipeline_ci;
+                relaxed_ci.flags = flags;
+                created = device.createComputePipelineUnique(cache, relaxed_ci);
+            }
+            if (created.result != vk::Result::eSuccess &&
+                created.result != vk::Result::ePipelineCompileRequired) {
+                auto plain_ci = compute_pipeline_ci;
+                plain_ci.flags = flags;
+                plain_ci.stage.pNext = nullptr;
+                created = device.createComputePipelineUnique(cache, plain_ci);
+            }
+            if (created.result == vk::Result::ePipelineCompileRequired &&
+                (flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired)) {
+                return {};
+            }
+            if (created.result == vk::Result::eSuccess) {
+                LOG_WARNING(Render_Vulkan,
+                            "iss: compute pipeline {} failed with {} and was built with fewer "
+                            "driver flags",
+                            debug_str, vk::to_string(first_error));
+            } else {
+                // Minimal SPIR-V: GLCompute "main", LocalSize 1 1 1, returns at once. It uses no
+                // binding, so it is compatible with this pipeline's layout.
+                static constexpr std::array<u32, 35> noop_spirv = {
+                    0x07230203u, 0x00010000u, 0x00000000u, 0x00000005u, 0x00000000u, // header
+                    0x00020011u, 0x00000001u,                           // OpCapability Shader
+                    0x0003000Eu, 0x00000000u, 0x00000001u,              // OpMemoryModel GLSL450
+                    0x0005000Fu, 0x00000005u, 0x00000001u, 0x6E69616Du, // OpEntryPoint GLCompute
+                    0x00000000u,                                        //   %1 "main"
+                    0x00060010u, 0x00000001u, 0x00000011u, 0x00000001u, // OpExecutionMode %1
+                    0x00000001u, 0x00000001u,                           //   LocalSize 1 1 1
+                    0x00020013u, 0x00000002u,                           // %2 = OpTypeVoid
+                    0x00030021u, 0x00000003u, 0x00000002u,              // %3 = OpTypeFunction %2
+                    0x00050036u, 0x00000002u, 0x00000001u, 0x00000000u, // %1 = OpFunction %2
+                    0x00000003u,                                        //   None %3
+                    0x000200F8u, 0x00000004u,                           // %4 = OpLabel
+                    0x000100FDu,                                        // OpReturn
+                    0x00010038u,                                        // OpFunctionEnd
+                };
+                auto [module_result, noop_module] = device.createShaderModuleUnique({
+                    .codeSize = noop_spirv.size() * sizeof(u32),
+                    .pCode = noop_spirv.data(),
+                });
+                if (module_result == vk::Result::eSuccess) {
+                    auto noop_ci = compute_pipeline_ci;
+                    noop_ci.flags = {};
+                    noop_ci.stage.pNext = nullptr;
+                    noop_ci.stage.module = *noop_module;
+                    created = device.createComputePipelineUnique(cache, noop_ci);
+                }
+                if (created.result == vk::Result::eSuccess) {
+                    LOG_WARNING(Render_Vulkan,
+                                "iss: compute pipeline {} failed with {}: replaced by an empty "
+                                "shader, its dispatches do nothing",
+                                debug_str, vk::to_string(first_error));
+                    std::printf("GPU: compute pipeline %s rejected by the Qualcomm driver (%s), "
+                                "dispatches skipped\n",
+                                std::string{debug_str}.c_str(),
+                                vk::to_string(first_error).c_str());
+                }
+            }
         }
         if (created.result == vk::Result::ePipelineCompileRequired &&
             (effective_flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired)) {

@@ -98,6 +98,28 @@ IR::Type CalculateSharedMemoryTypes(IR::Program& program) {
     return used_types;
 }
 
+static bool HasSharedAtomics(IR::Program& program) {
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (!IsSharedAccess(inst)) {
+                continue;
+            }
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::LoadSharedU16:
+            case IR::Opcode::LoadSharedU32:
+            case IR::Opcode::LoadSharedU64:
+            case IR::Opcode::WriteSharedU16:
+            case IR::Opcode::WriteSharedU32:
+            case IR::Opcode::WriteSharedU64:
+                break;
+            default:
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_info,
                                const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute) {
@@ -109,11 +131,17 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
     // * One of the following is true:
     //   * Requested shared memory size is too large for the host shared memory.
     //   * Workgroup explicit memory is not supported and multiple shared memory types are used.
+    //   * iss: the host compiler crashes on Workgroup atomics (Qualcomm libllvm-qgl.so on the
+    //     Quest 3S, any @llvm.qgpu.atomic.*.oob.p3i32) and the shader uses one: its LDS becomes
+    //     a storage buffer, with native buffer atomics instead.
     const u32 shared_memory_size = runtime_info.hw.cs.shared_memory_size;
     const auto used_types = CalculateSharedMemoryTypes(program);
-    if (used_types == IR::Type::Void || (shared_memory_size <= profile.max_shared_memory_size &&
-                                         (profile.supports_workgroup_explicit_memory_layout ||
-                                          std::popcount(static_cast<u32>(used_types)) == 1))) {
+    const bool atomics_to_storage =
+        profile.needs_shared_atomics_to_storage && HasSharedAtomics(program);
+    if (used_types == IR::Type::Void ||
+        (!atomics_to_storage && shared_memory_size <= profile.max_shared_memory_size &&
+         (profile.supports_workgroup_explicit_memory_layout ||
+          std::popcount(static_cast<u32>(used_types)) == 1))) {
         return;
     }
 

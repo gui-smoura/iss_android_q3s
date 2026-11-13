@@ -24,14 +24,21 @@
 #include <unistd.h>
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. TLG_DMEM_MB raises it (the resolution
- * patches above 1080p need about 4 GiB more; run.sh sets it). */
+ * patches above 1080p need about 4 GiB more; run.sh sets it).
+ * On Android Bionic (Quest 3S 8 GB RAM), ISS_DIRECT_MEM_MB (default 3072 MiB) caps what is
+ * reported so the game streams within physical memory headroom instead of reserving ~5 GiB. */
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
-        const char *env = getenv("TLG_DMEM_MB");
+        const char *env = getenv("ISS_DIRECT_MEM_MB");
+        if (!env || !*env) env = getenv("TLG_DMEM_MB");
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
+#ifdef __ANDROID__
+        if (mb < 1024 || mb > 16384) mb = 3072;
+#else
         if (mb < 5056 || mb > 16384) mb = 5056;
-        size = mb * 1024 * 1024;
+#endif
+        size = mb * UINT64_C(1024) * UINT64_C(1024);
     }
     return size;
 }
@@ -285,14 +292,60 @@ static int pool(void) {
     return backing_base ? 0 : -1;
 }
 #else
-/* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
+/* Direct memory occupies [0,POOL_SIZE) of the backing file/memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
+static int open_backing_file(uint64_t total_bytes) {
+    const char *file_env = getenv("ISS_DIRECT_MEM_FILE");
+#ifdef __ANDROID__
+    if (file_env && file_env[0] == '0') return -1;
+#else
+    if (!(file_env && file_env[0] == '1')) return -1;
+#endif
+    char path[4096];
+    const char *explicit_path = getenv("ISS_DIRECT_MEM_PATH");
+    const char *data_dir = getenv("TLG_DATA_DIR");
+    const char *fxd_files = getenv("FXD_FILES");
+    if (explicit_path && *explicit_path) {
+        snprintf(path, sizeof(path), "%s", explicit_path);
+    } else if (data_dir && *data_dir) {
+        snprintf(path, sizeof(path), "%s/direct_mem.bin", data_dir);
+    } else if (fxd_files && *fxd_files) {
+        snprintf(path, sizeof(path), "%s/issport/direct_mem.bin", fxd_files);
+    } else {
+        return -1;
+    }
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "Runtime: cannot open file-backed arena %s (%s); falling back to memfd\n",
+                path, strerror(errno));
+        return -1;
+    }
+    /* Unlink immediately so disk space is automatically reclaimed on exit or LMKD kill. */
+    unlink(path);
+    if (ftruncate(fd, (off_t)total_bytes) != 0) {
+        fprintf(stderr, "Runtime: ftruncate(%" PRIu64 ") on %s failed (%s); falling back to memfd\n",
+                total_bytes, path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static int pool(void) {
     if (pool_fd>=0) return 0;
-    pool_fd=memfd_create("tlg-guest-memory", MFD_CLOEXEC);
-    if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) return -1;
-    void *view=mmap(NULL,POOL_SIZE+FLEX_SPAN,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_NORESERVE,pool_fd,0);
+    uint64_t total_bytes = POOL_SIZE + FLEX_SPAN;
+    int file_backed = 0;
+    pool_fd = open_backing_file(total_bytes);
+    if (pool_fd >= 0) {
+        file_backed = 1;
+    } else {
+        pool_fd = memfd_create("tlg-guest-memory", MFD_CLOEXEC);
+        if (pool_fd < 0 || ftruncate(pool_fd, (off_t)total_bytes)) return -1;
+    }
+    void *view=mmap(NULL,total_bytes,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_NORESERVE,pool_fd,0);
     if (view==MAP_FAILED) return -1;
     backing_base=view;
+    printf("Runtime: direct memory pool %" PRIu64 " MiB (%s)\n",
+           (uint64_t)(POOL_SIZE >> 20), file_backed ? "file-backed sparse" : "memfd");
     return 0;
 }
 void runtime_memory_reserve(void) {}

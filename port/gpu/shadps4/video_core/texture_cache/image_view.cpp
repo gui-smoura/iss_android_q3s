@@ -9,6 +9,7 @@
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
 namespace VideoCore {
@@ -153,6 +154,19 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         }
     }
 
+    static const bool drop_mip0_env = [] {
+        const char* env = std::getenv("TLG_DROP_MIP0");
+        return env && env[0] == '1';
+    }();
+    u32 view_base_mip = info.range.base.level;
+    u32 view_level_count = info.range.extent.levels;
+    if (drop_mip0_env && image.info.resources.levels > 1 && image.info.props.is_block &&
+        !image.info.props.is_depth && False(image.flags & ImageFlagBits::GpuModified) &&
+        view_base_mip == 0 && view_level_count > 1) {
+        view_base_mip = 1;
+        view_level_count -= 1;
+    }
+
     const vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,
         .image = image.GetImage(),
@@ -165,8 +179,8 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         .components = info.mapping,
         .subresourceRange{
             .aspectMask = aspect,
-            .baseMipLevel = info.range.base.level,
-            .levelCount = info.range.extent.levels,
+            .baseMipLevel = view_base_mip,
+            .levelCount = view_level_count,
             .baseArrayLayer = info.range.base.layer,
             .layerCount = info.range.extent.layers,
         },

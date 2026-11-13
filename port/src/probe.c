@@ -1352,7 +1352,6 @@ int main(int argc, char **argv) {
     alias_port_environment();
     apply_verbose_log();
     boot_step("start");
-    guest_cpu_init(runtime_low_map);
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -1384,12 +1383,14 @@ int main(int argc, char **argv) {
     runtime_memory_reserve();
     runtime_thread_tcb_offset();
 #endif
-    int cpu_only = 0, strict_imports = 0, check_imports = 0;
+    int cpu_only = 0, strict_imports = 0, check_imports = 0, warmup_only = 0;
     unsigned timeout_seconds = 10;
     const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *isa_file=NULL;
     const char *mounts[8]; int mount_count=0;
-    for (int i = 2; i < argc; ++i) {
+    int first_opt = (argc >= 2 && argv[1][0] == '-') ? 1 : 2;
+    for (int i = first_opt; i < argc; ++i) {
         if (!strcmp(argv[i], "--cpu-only")) cpu_only = 1;
+        else if (!strcmp(argv[i], "--warmup-only")) warmup_only = 1;
         else if (!strcmp(argv[i], "--strict-imports")) strict_imports = 1;
         else if (!strcmp(argv[i], "--check-imports")) check_imports = 1;
         else if (!strcmp(argv[i], "--content-profile") && i+1<argc) content_profile=argv[++i];
@@ -1407,7 +1408,7 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--check-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--isa-rewrite file] [--mount guest=host]... [--timeout seconds] | --vulkan-only | --cpu-features | --gamepad\n", argv[0]);
+        fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--warmup-only] [--strict-imports] [--check-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--isa-rewrite file] [--mount guest=host]... [--timeout seconds] | --vulkan-only | --cpu-features | --gamepad\n", argv[0]);
         return 1;
     }
     {
@@ -1420,6 +1421,20 @@ int main(int argc, char **argv) {
         printf("Build: %s (built %s %s); game %s %s; threads inherit the creator's MXCSR/x87 control\n",
                TLG_BUILD_COMMIT, __DATE__, __TIME__, serial, version);
     }
+    if (warmup_only) {
+        char title[128]="inFAMOUS Second Son", serial[16]="UNKNOWN", sfo[4096];
+        uint32_t attributes=0;
+        snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
+        sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
+        sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
+        sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);
+        TlgGpuConfig gpu={title,serial,user_dir ? user_dir : "user",0,attributes,1280,720};
+        boot_step("starting shader warmup-only");
+        int rc = tlggpu_warmup_only(&gpu);
+        fflush(NULL);
+        _exit(rc);
+    }
+    guest_cpu_init(runtime_low_map);
     if (!cpu_supported(missing, sizeof missing)) return 20;
     if (cpu_missing_sets) printf("CPU: missing %s\n", missing);
     boot_step("cpu check done");

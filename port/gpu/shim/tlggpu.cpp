@@ -298,6 +298,46 @@ extern "C" void tlggpu_init_headless(const TlgGpuConfig* config) {
     Core::Emulator::FillElfInfo(*config);
 }
 
+extern "C" int tlggpu_warmup_only(const TlgGpuConfig* config) {
+    tlggpu_init_headless(config);
+    LogPlayerConfig();
+    std::printf("Warmup-only: initializing headless Vulkan device for %s\n",
+                config && config->serial ? config->serial : "unknown");
+    try {
+        Vulkan::Instance instance{EmulatorSettings.GetGpuId(),
+                                  EmulatorSettings.IsVkValidationEnabled()};
+        Vulkan::Scheduler scheduler{instance, false};
+        // Default 16 KiB sparse page shift (14) matches BufferCache on Adreno/Turnip.
+        Vulkan::PipelineCache cache{instance, scheduler, nullptr, 14};
+        cache.PrecompileFirstStart(
+            [](u32 total) {
+                std::printf("Warmup-only: precompiling %u job records\n", total);
+                std::fflush(stdout);
+            },
+            [](u32 done, u32 total) {
+                if (done == total || (done % 16) == 0) {
+                    std::printf("Warmup-only: precompile %u / %u\n", done, total);
+                    std::fflush(stdout);
+                }
+            });
+        u32 last_reported = 0;
+        cache.WarmUp([&](u32 done, u32 total) {
+            if (done == total || done >= last_reported + 16) {
+                last_reported = done;
+                std::printf("Warmup-only: pipeline cache %u / %u\n", done, total);
+                std::fflush(stdout);
+            }
+        });
+        const bool saved = cache.SaveDriverCache();
+        std::printf("Warmup-only: finished (driver pipeline cache saved=%d)\n", int(saved));
+        std::fflush(stdout);
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Warmup-only failed: %s\n", e.what());
+        return 1;
+    }
+}
+
 extern "C" int tlggpu_init(const TlgGpuConfig* config) {
     TlgSettings::Load();
     // tlg: the fixes chosen in the launcher or the in-game menu (bpNN in tlg.ini); an environment
