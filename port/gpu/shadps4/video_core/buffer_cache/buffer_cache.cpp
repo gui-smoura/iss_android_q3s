@@ -1126,7 +1126,7 @@ u64 BufferCache::EvictUnusedResidency(u64 target_bytes, u64 min_age_ticks) {
     }
 
     if (residency_chunk && victim_keys.contains(MemoryKey(residency_chunk))) {
-        residency_chunk = {};
+        residency_chunk = vk::DeviceMemory{};
         residency_chunk_used = 0;
     }
 
