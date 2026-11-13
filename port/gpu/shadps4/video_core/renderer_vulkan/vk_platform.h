@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <string_view>
 #include <fmt/format.h>
 
 #include "common/assert.h"
@@ -26,6 +28,22 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                                   bool enable_crash_diagnostic);
 
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance);
+
+inline void WarnIncomplete(std::string_view context) {
+    static std::atomic<u64> count{0};
+    const u64 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n & (n - 1)) == 0) {
+        if (context.empty()) {
+            LOG_WARNING(Render_Vulkan, "Vulkan call returned VK_INCOMPLETE (#{})", n);
+        } else {
+            LOG_WARNING(Render_Vulkan, "{} returned VK_INCOMPLETE (#{})", context, n);
+        }
+    }
+}
+
+[[nodiscard]] constexpr bool IsVulkanOk(vk::Result r) noexcept {
+    return r == vk::Result::eSuccess || r == vk::Result::eIncomplete;
+}
 
 template <typename T>
 concept VulkanHandleType = vk::isVulkanHandleType<T>::value;
@@ -52,6 +70,10 @@ void SetObjectName(vk::Device device, const HandleType& handle, const char* form
 
 template <StringLiteral msg = "">
 static void Check(vk::Result r) {
+    if (r == vk::Result::eIncomplete) {
+        WarnIncomplete(msg.len > 1 ? std::string_view{msg.value, msg.len - 1} : std::string_view{});
+        return;
+    }
     if constexpr (msg.len <= 1) {
         ASSERT_MSG(r == vk::Result::eSuccess, "vk::Result={}", vk::to_string(r));
     } else {
@@ -62,6 +84,10 @@ static void Check(vk::Result r) {
 
 template <StringLiteral msg = "", typename T>
 static T Check(vk::ResultValue<T> r) {
+    if (r.result == vk::Result::eIncomplete) {
+        WarnIncomplete(msg.len > 1 ? std::string_view{msg.value, msg.len - 1} : std::string_view{});
+        return std::move(r.value);
+    }
     if constexpr (msg.len <= 1) {
         ASSERT_MSG(r.result == vk::Result::eSuccess, "vk::Result={}", vk::to_string(r.result));
     } else {

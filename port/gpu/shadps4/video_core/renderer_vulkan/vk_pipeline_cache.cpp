@@ -46,6 +46,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -463,18 +464,28 @@ bool PipelineCache::SaveDriverCacheUnchecked() {
     }
     const auto device = instance.GetDevice();
     auto [scratch_result, scratch] = device.createPipelineCacheUnique({});
-    if (scratch_result != vk::Result::eSuccess) {
+    if (scratch_result == vk::Result::eIncomplete) {
+        WarnIncomplete("SaveDriverCache createPipelineCacheUnique");
+    }
+    if (!IsVulkanOk(scratch_result)) {
         return false;
     }
     std::vector<vk::PipelineCache> sources{*pipeline_cache};
     for (const auto& cache : worker_pipeline_caches) {
         sources.push_back(*cache);
     }
-    if (device.mergePipelineCaches(*scratch, sources) != vk::Result::eSuccess) {
+    const auto merge_res = device.mergePipelineCaches(*scratch, sources);
+    if (merge_res == vk::Result::eIncomplete) {
+        WarnIncomplete("SaveDriverCache mergePipelineCaches");
+    }
+    if (!IsVulkanOk(merge_res)) {
         return false;
     }
     auto [result, blob] = device.getPipelineCacheData(*scratch);
-    if (result != vk::Result::eSuccess || blob.size() < sizeof(VkPipelineCacheHeaderVersionOne)) {
+    if (result == vk::Result::eIncomplete) {
+        WarnIncomplete("SaveDriverCache getPipelineCacheData");
+    }
+    if (!IsVulkanOk(result) || blob.size() < sizeof(VkPipelineCacheHeaderVersionOne)) {
         return false;
     }
     // tlg: TLG_DRIVER_CACHE_MAX_MB (default 1024, 0 = no limit): a bigger blob is not written,
@@ -695,15 +706,21 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(
         {.initialDataSize = driver_blob.size(),
          .pInitialData = driver_blob.empty() ? nullptr : driver_blob.data()});
-    if (cache_result != vk::Result::eSuccess && !driver_blob.empty()) {
+    if (cache_result == vk::Result::eIncomplete) {
+        WarnIncomplete("createPipelineCacheUnique");
+    }
+    if (!IsVulkanOk(cache_result) && !driver_blob.empty()) {
         std::printf("GPU: driver rejected the saved pipeline cache (%s), starting empty (file kept)\n",
                     vk::to_string(cache_result).c_str());
         driver_blob.clear();
         auto retry = instance.GetDevice().createPipelineCacheUnique({});
         cache_result = retry.result;
         cache = std::move(retry.value);
+        if (cache_result == vk::Result::eIncomplete) {
+            WarnIncomplete("createPipelineCacheUnique retry");
+        }
     }
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+    ASSERT_MSG(IsVulkanOk(cache_result), "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
     // tlg: the compiler threads always exist; the in-game menu switches async compilation live
@@ -730,7 +747,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                     count, capture_count, int(native_bionic));
         for (unsigned i = 0; i < count; ++i) {
             auto [result, worker_cache] = instance.GetDevice().createPipelineCacheUnique({});
-            ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create compiler pipeline cache");
+            if (result == vk::Result::eIncomplete) {
+                WarnIncomplete("createPipelineCacheUnique worker");
+            }
+            ASSERT_MSG(IsVulkanOk(result), "Failed to create compiler pipeline cache: {}",
+                       vk::to_string(result));
             worker_pipeline_caches.push_back(std::move(worker_cache));
         }
         capture_compiler = std::make_unique<AsyncCompiler>(capture_count, 8, [](unsigned index) {
@@ -1012,9 +1033,17 @@ void PipelineCache::FinishCompilations() {
         for (const auto& cache : worker_pipeline_caches) {
             sources.push_back(*cache);
         }
-        const auto result = instance.GetDevice().mergePipelineCaches(*pipeline_cache, sources);
-        if (result != vk::Result::eSuccess) {
-            LOG_ERROR(Render_Vulkan, "tlg: compiler cache merge failed: {}", vk::to_string(result));
+        if (!sources.empty()) {
+            const auto result = instance.GetDevice().mergePipelineCaches(*pipeline_cache, sources);
+            if (result == vk::Result::eIncomplete) {
+                WarnIncomplete("FinishCompilations mergePipelineCaches");
+            }
+            if (!IsVulkanOk(result)) {
+                LOG_ERROR(Render_Vulkan, "tlg: compiler cache merge failed: {}",
+                          vk::to_string(result));
+            } else {
+                g_tlg_driver_pipelines_created.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 }
@@ -1029,7 +1058,11 @@ void PipelineCache::SeedWorkerCaches() {
     }
     for (const auto& cache : worker_pipeline_caches) {
         const auto result = instance.GetDevice().mergePipelineCaches(*cache, *pipeline_cache);
-        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to seed compiler pipeline cache");
+        if (result == vk::Result::eIncomplete) {
+            WarnIncomplete("SeedWorkerCaches mergePipelineCaches");
+        }
+        ASSERT_MSG(IsVulkanOk(result), "Failed to seed compiler pipeline cache: {}",
+                   vk::to_string(result));
     }
     worker_caches_seeded = true;
 }

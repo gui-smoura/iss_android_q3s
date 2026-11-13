@@ -2141,6 +2141,7 @@ void Rasterizer::OnSubmit() {
     }
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
+    buffer_cache.RunGarbageCollector();
     if (HugeWarmEnabled()) {
         // One slice of each remembered heap this session has not bound yet. The draw pipe was
         // drained above, so no draw is binding buffers meanwhile.

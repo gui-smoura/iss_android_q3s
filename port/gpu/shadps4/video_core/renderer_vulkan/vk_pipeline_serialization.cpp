@@ -452,17 +452,19 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
             vk::PipelineBinaryKeyKHR binary_key;
             size_t size = 0;
             auto* raw_key = reinterpret_cast<VkPipelineBinaryKeyKHR*>(&binary_key);
-            if (dispatch.vkGetPipelineBinaryDataKHR(device, &data_info, raw_key, &size, nullptr) !=
-                    VK_SUCCESS ||
-                !size || size > MaxFileSize || total_size + size > MaxFileSize ||
+            const VkResult size_res =
+                dispatch.vkGetPipelineBinaryDataKHR(device, &data_info, raw_key, &size, nullptr);
+            if ((size_res != VK_SUCCESS && size_res != VK_INCOMPLETE) || !size ||
+                size > MaxFileSize || total_size + size > MaxFileSize ||
                 !ValidKey(BinaryKey(binary_key))) {
                 ++binary_errors;
                 return result;
             }
             total_size += size;
             Binary binary{BinaryKey(binary_key), std::vector<u8>(size)};
-            if (dispatch.vkGetPipelineBinaryDataKHR(device, &data_info, raw_key, &size,
-                                                    binary.data.data()) != VK_SUCCESS ||
+            const VkResult data_res = dispatch.vkGetPipelineBinaryDataKHR(
+                device, &data_info, raw_key, &size, binary.data.data());
+            if ((data_res != VK_SUCCESS && data_res != VK_INCOMPLETE) ||
                 size > binary.data.size()) {
                 ++binary_errors;
                 return result;

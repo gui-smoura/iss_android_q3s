@@ -4,6 +4,7 @@
 #pragma once
 
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <shared_mutex>
@@ -194,7 +195,8 @@ public:
     /// tlg: the first start's compilation: the job file when this cache has not compiled it
     /// yet (or a crash interrupted it). `start(total)` before the first record; false: nothing to do.
     bool PrecompileFirstStart(const std::function<void(u32 total)>& start,
-                              const std::function<void(u32 done, u32 total)>& progress);
+                              const std::function<void(u32 done, u32 total)>& progress,
+                              std::string* out_status = nullptr);
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
                               std::optional<Shader::Gcn::FetchShaderData>, u64>;

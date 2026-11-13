@@ -9,11 +9,14 @@
 #include <unordered_map>
 #include <algorithm>
 #include <bit>
+#include <cerrno>
 #include <cstdlib>
+#include <unordered_set>
 #include <magic_enum/magic_enum.hpp>
 #include "tlg_copy.h"
 #include "tlg_toggles.h"
 #include "common/alignment.h"
+#include "common/scope_exit.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -34,12 +37,70 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 // Memory is made resident in aligned granules of this size. Sparse binds get slower the more is
 // already bound on some drivers, so it pays to bind a little ahead in few larger operations
 // rather than a block at a time as the game streams data in.
-static constexpr u64 RESIDENCY_GRANULE_SIZE = 16_MB;
 #if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
 static constexpr u64 RESIDENCY_CHUNK_SIZE = 64_MB;
 #else
 static constexpr u64 RESIDENCY_CHUNK_SIZE = 256_MB;
 #endif
+
+namespace {
+bool TryParseStrictUnsignedMb(const char* name, u64& out_mb) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] < '0' || value[0] > '9') {
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0') {
+        return false;
+    }
+    out_mb = static_cast<u64>(parsed);
+    return true;
+}
+} // namespace
+
+u64 BufferCache::ResidencyGranuleSize() {
+    static const u64 bytes = [] {
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+        u64 mb = 4;
+#else
+        u64 mb = 16;
+#endif
+        for (const char* name : {"ISS_RESIDENCY_GRANULE_MB", "TLG_RESIDENCY_GRANULE_MB"}) {
+            if (TryParseStrictUnsignedMb(name, mb)) {
+                break;
+            }
+        }
+        return std::bit_floor(std::clamp<u64>(mb, 1, 64)) << 20;
+    }();
+    return bytes;
+}
+
+u64 BufferCache::ResidencyBudgetBytes() {
+    static const u64 bytes = []() -> u64 {
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+        u64 mb = 1024;
+#else
+        u64 mb = 0;
+#endif
+        for (const char* name : {"ISS_BUFFER_CACHE_BUDGET_MB", "TLG_BUFFER_CACHE_BUDGET_MB"}) {
+            if (TryParseStrictUnsignedMb(name, mb)) {
+                break;
+            }
+        }
+        if (mb == 0) {
+            return 0;
+        }
+        return std::clamp<u64>(mb, 128, 4096) << 20;
+    }();
+    return bytes;
+}
+
+u64 BufferCache::MemoryKey(vk::DeviceMemory memory) noexcept {
+    static_assert(sizeof(VkDeviceMemory) == sizeof(u64));
+    return std::bit_cast<u64>(static_cast<VkDeviceMemory>(memory));
+}
 
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
@@ -108,6 +169,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                 static_cast<unsigned long long>(arena_page_size >> 20),
                 static_cast<unsigned long long>(max_arena_pages),
                 static_cast<unsigned long long>(max_buffer >> 20));
+    std::printf("GPU: buffer residency granule=%llu MiB, chunk=%llu MiB, budget=%llu MiB\n",
+                static_cast<unsigned long long>(ResidencyGranuleSize() >> 20),
+                static_cast<unsigned long long>(RESIDENCY_CHUNK_SIZE >> 20),
+                static_cast<unsigned long long>(ResidencyBudgetBytes() >> 20));
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -798,9 +863,10 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
     // Granules never cross an arena page (1 GiB or more), so the widened range stays within the
     // arena.
-    const u64 granule_blocks = std::max<u64>(RESIDENCY_GRANULE_SIZE >> block_shift, 1);
+    const u64 granule_blocks = std::max<u64>(ResidencyGranuleSize() >> block_shift, 1);
     const u64 bind_first = Common::AlignDown(first_block, granule_blocks);
     const u64 bind_end = Common::AlignUp(last_block + 1, granule_blocks);
+    TouchResidencyRange(bind_first, bind_end);
 
     for (u32 attempt = 0;; ++attempt) {
         u32 resident_blocks{};
@@ -897,6 +963,13 @@ std::optional<std::pair<vk::DeviceMemory, u64>> BufferCache::AllocateResidency(
         if (mapped_readbacks_enabled) {
             residency_mappings.emplace(memory, ResidencyMapping{.size = allocation_size});
         }
+        residency_allocations_map.emplace(MemoryKey(memory),
+                                          ResidencyAllocation{
+                                              .memory = memory,
+                                              .size = allocation_size,
+                                              .last_used_tick = residency_gc_tick,
+                                          });
+        residency_total_bytes += allocation_size;
         attempt.allocated.push_back(memory);
         ++residency_allocations;
         return memory;
@@ -927,6 +1000,10 @@ std::optional<std::pair<vk::DeviceMemory, u64>> BufferCache::AllocateResidency(
     }
     const u64 offset = residency_chunk_used;
     residency_chunk_used += size;
+    if (auto it = residency_allocations_map.find(MemoryKey(residency_chunk));
+        it != residency_allocations_map.end()) {
+        it->second.last_used_tick = residency_gc_tick;
+    }
     return Allocation{residency_chunk, offset};
 }
 
@@ -936,6 +1013,13 @@ void BufferCache::UndoResidency(const ResidencyAttempt& attempt) {
         if (auto it = residency_mappings.find(memory); it != residency_mappings.end()) {
             if (it->second.data) instance.GetDevice().unmapMemory(memory);
             residency_mappings.erase(it);
+        }
+        const u64 key = MemoryKey(memory);
+        if (auto it = residency_allocations_map.find(key); it != residency_allocations_map.end()) {
+            residency_total_bytes = residency_total_bytes > it->second.size
+                                        ? residency_total_bytes - it->second.size
+                                        : 0;
+            residency_allocations_map.erase(it);
         }
         instance.GetDevice().freeMemory(memory);
     }
@@ -968,6 +1052,214 @@ void BufferCache::ReleaseMemoryForResidency(u64 bytes) {
     // deletions run after it, so the second attempt may still fail there.
     scheduler.Finish();
     scheduler.PopPendingOperations();
+    const u64 budget = ResidencyBudgetBytes();
+    const u64 headroom_target = residency_total_bytes > bytes ? residency_total_bytes - bytes : 0;
+    const u64 target = budget > 0 ? std::min<u64>(budget, headroom_target) : headroom_target;
+    if (residency_total_bytes > target) {
+        const u64 freed = EvictUnusedResidency(target, 2);
+        if (freed > 0) {
+            LOG_WARNING(Render, "Evicted {} MB from BufferCache to recover device memory",
+                        freed >> 20);
+        }
+        scheduler.Finish();
+        scheduler.PopPendingOperations();
+    }
+}
+
+void BufferCache::TouchResidencyRange(u64 first_block, u64 end_block) {
+    resident_ranges.ForEachInRange(first_block, end_block, [&](const Backing& backing) {
+        if (auto it = residency_allocations_map.find(MemoryKey(backing.memory));
+            it != residency_allocations_map.end()) {
+            it->second.last_used_tick = residency_gc_tick;
+        }
+    });
+}
+
+u64 BufferCache::EvictUnusedResidency(u64 target_bytes, u64 min_age_ticks) {
+    if (evicting_residency || residency_total_bytes <= target_bytes) {
+        return 0;
+    }
+    // Drain in-flight GPU work and deferred fault callbacks first before latching eviction so
+    // pending accesses can settle and refresh allocation LRU timestamps.
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    if (evicting_residency || residency_total_bytes <= target_bytes) {
+        return 0;
+    }
+    evicting_residency = true;
+    SCOPE_EXIT {
+        evicting_residency = false;
+    };
+
+    struct Victim {
+        u64 key;
+        ResidencyAllocation alloc;
+    };
+    std::vector<Victim> candidates;
+    candidates.reserve(residency_allocations_map.size());
+    for (const auto& [key, alloc] : residency_allocations_map) {
+        if (residency_gc_tick >= alloc.last_used_tick &&
+            residency_gc_tick - alloc.last_used_tick >= min_age_ticks) {
+            candidates.push_back({key, alloc});
+        }
+    }
+    if (candidates.empty()) {
+        return 0;
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Victim& a, const Victim& b) {
+        return a.alloc.last_used_tick < b.alloc.last_used_tick;
+    });
+
+    std::vector<Victim> victims;
+    std::unordered_set<u64> victim_keys;
+    u64 projected = residency_total_bytes;
+    for (const auto& cand : candidates) {
+        if (projected <= target_bytes) {
+            break;
+        }
+        victims.push_back(cand);
+        victim_keys.insert(cand.key);
+        projected = projected > cand.alloc.size ? projected - cand.alloc.size : 0;
+    }
+    if (victims.empty()) {
+        return 0;
+    }
+
+    if (residency_chunk && victim_keys.contains(MemoryKey(residency_chunk))) {
+        residency_chunk = {};
+        residency_chunk_used = 0;
+    }
+
+    struct EvictChunk {
+        const Buffer* arena;
+        u64 start_block;
+        u64 end_block;
+    };
+    std::vector<EvictChunk> chunks;
+    for (const auto& backing : resident_ranges) {
+        if (!victim_keys.contains(MemoryKey(backing.memory))) {
+            continue;
+        }
+        u64 cur = backing.start;
+        while (cur < backing.end) {
+            const u64 page = cur >> blocks_per_arena_page_shift;
+            const u64 page_end = (page + 1) << blocks_per_arena_page_shift;
+            const u64 next = std::min(backing.end, page_end);
+            const Buffer* arena = page < address_space.size() ? address_space[page] : nullptr;
+            chunks.push_back({arena, cur, next});
+            cur = next;
+        }
+    }
+
+    if (deferred_count.load(std::memory_order_acquire)) {
+        auto range_touches_victims = [&](const DeferredReadback& rb) {
+            for (const auto& span : rb.mapped_spans) {
+                if (victim_keys.contains(MemoryKey(span.memory))) {
+                    return true;
+                }
+            }
+            for (const auto& chunk : chunks) {
+                if (rb.CopiesTouchPages(chunk.start_block << block_shift,
+                                        chunk.end_block << block_shift)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        boost::container::small_vector<std::shared_ptr<DeferredReadback>, 8> affected;
+        {
+            std::scoped_lock lock{deferred_mutex};
+            for (const auto& rb : deferred_readbacks) {
+                if (!rb->Done() && range_touches_victims(*rb)) {
+                    affected.push_back(rb);
+                }
+            }
+        }
+        for (const auto& rb : affected) {
+            if (!FinishDeferredReadback(*rb, true)) {
+                RecoverDeferredReadback(*rb);
+            }
+        }
+        PruneDeferredReadbacks();
+    }
+
+    // Pass 1: preserve any GPU-modified bytes in guest backing memory and mark pages CPU-modified
+    // so subsequent accesses re-upload cleanly when re-bound.
+    for (const auto& chunk : chunks) {
+        const VAddr addr = chunk.start_block << block_shift;
+        const u64 size = (chunk.end_block - chunk.start_block) << block_shift;
+        MarkEagerStale(addr, size);
+        if (chunk.arena) {
+            DownloadMemory(chunk.arena, addr, size);
+        }
+        gpu_modified_ranges.Subtract(addr, size);
+        memory_tracker->UnmarkRegionAsGpuModified(addr, size);
+        memory_tracker->MarkRegionAsCpuModified(addr, size);
+    }
+
+    // Pass 2: queue sparse unbinds, clear BDA page table entries, and flush before freeing memory.
+    for (const auto& chunk : chunks) {
+        if (chunk.arena) {
+            BindsForArena(chunk.arena)->binds.emplace_back(vk::SparseMemoryBind{
+                .resourceOffset = (chunk.start_block << block_shift) - chunk.arena->cpu_addr,
+                .size = (chunk.end_block - chunk.start_block) << block_shift,
+                .memory = {},
+                .memoryOffset = 0,
+            });
+        }
+        runtime.FillBuffer(bda_pagetable_buffer.get(), chunk.start_block * sizeof(vk::DeviceAddress),
+                           (chunk.end_block - chunk.start_block) * sizeof(vk::DeviceAddress), 0u);
+        resident_ranges.Remove(chunk.start_block, chunk.end_block);
+    }
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+
+    u64 freed_bytes = 0;
+    const auto device = instance.GetDevice();
+    for (const auto& victim : victims) {
+        if (auto it = residency_mappings.find(victim.alloc.memory);
+            it != residency_mappings.end()) {
+            if (it->second.data) {
+                device.unmapMemory(victim.alloc.memory);
+            }
+            residency_mappings.erase(it);
+        }
+        device.freeMemory(victim.alloc.memory);
+        residency_allocations_map.erase(victim.key);
+        residency_total_bytes =
+            residency_total_bytes > victim.alloc.size ? residency_total_bytes - victim.alloc.size : 0;
+        if (residency_allocations > 0) {
+            --residency_allocations;
+        }
+        freed_bytes += victim.alloc.size;
+    }
+    return freed_bytes;
+}
+
+void BufferCache::RunGarbageCollector() {
+    SCOPE_EXIT {
+        ++residency_gc_tick;
+    };
+    const u64 budget = ResidencyBudgetBytes();
+    if (budget == 0 || (residency_gc_tick % 64) != 0 || residency_total_bytes <= budget) {
+        return;
+    }
+    constexpr u64 MinAgeTicks = 30;
+    const u64 target = (budget * 7) / 8;
+    const u64 before = residency_total_bytes;
+    const u64 freed = EvictUnusedResidency(target, MinAgeTicks);
+    if (freed > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (residency_gc_report_time.time_since_epoch().count() == 0 ||
+            now - residency_gc_report_time >= std::chrono::seconds{5}) {
+            residency_gc_report_time = now;
+            std::printf("GPU: BufferCache GC evicted %llu MB (%llu MB -> %llu MB, budget %llu MB)\n",
+                        static_cast<unsigned long long>(freed >> 20),
+                        static_cast<unsigned long long>(before >> 20),
+                        static_cast<unsigned long long>(residency_total_bytes >> 20),
+                        static_cast<unsigned long long>(budget >> 20));
+        }
+    }
 }
 
 namespace {

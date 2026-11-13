@@ -6,12 +6,14 @@
 #include "tlg_copy.h"
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 #include <optional>
 #include <utility>
@@ -135,6 +137,9 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// Periodically trims aged sparse buffer allocations when exceeding the configured budget.
+    void RunGarbageCollector();
+
 private:
     struct ArenaBinds {
         const Buffer* arena;
@@ -169,6 +174,12 @@ private:
     /// Frees old textures and waits for the GPU to release their memory, after an allocation
     /// for residency failed for lack of device memory.
     void ReleaseMemoryForResidency(u64 bytes);
+
+    static u64 ResidencyGranuleSize();
+    static u64 ResidencyBudgetBytes();
+    static u64 MemoryKey(vk::DeviceMemory memory) noexcept;
+    void TouchResidencyRange(u64 first_block, u64 end_block);
+    u64 EvictUnusedResidency(u64 target_bytes, u64 min_age_ticks);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
@@ -368,6 +379,17 @@ private:
     vk::DeviceMemory residency_chunk{};
     u64 residency_chunk_used{};
     u64 residency_allocations{};
+
+    struct ResidencyAllocation {
+        vk::DeviceMemory memory{};
+        u64 size = 0;
+        u64 last_used_tick = 0;
+    };
+    std::unordered_map<u64, ResidencyAllocation> residency_allocations_map;
+    u64 residency_total_bytes{};
+    u64 residency_gc_tick{1};
+    std::chrono::steady_clock::time_point residency_gc_report_time{};
+    bool evicting_residency{false};
 
     struct ResidencyMapping {
         u64 size = 0;

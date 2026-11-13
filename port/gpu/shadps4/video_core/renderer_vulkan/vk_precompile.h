@@ -76,6 +76,9 @@ struct Result {
     u32 records = 0, graphics = 0, compute = 0, failed = 0, skipped = 0;
 };
 
+/// Resolves the job file across environment overrides, user/game cache directories, and
+/// Android shared folders (including sibling <serial>-jobs.json when present).
+std::filesystem::path ResolveJobFile(std::filesystem::path* out_json = nullptr);
 /// The job file of this game: TLG_PRECOMPILE_JOBS, else <gpu user>/cache/<serial>-jobs.bin
 /// (the launcher writes it from the game files; it outlives cache rebuilds).
 std::filesystem::path JobFile();

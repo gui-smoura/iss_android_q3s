@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // tlg: first-run shader compilation (see vk_precompile.h).
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -24,7 +25,9 @@
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_precompile.h"
 #include "common/elf_info.h"
 #include "core/emulator_settings.h"
@@ -235,12 +238,91 @@ void CaptureCompute(const PipelineSelection& sel, const AmdGpu::ComputeProgram& 
           record);
 }
 
-std::filesystem::path JobFile() {
-    if (const char* path = std::getenv("TLG_PRECOMPILE_JOBS"); path && *path) {
-        return path;
+std::filesystem::path ResolveJobFile(std::filesystem::path* out_json) {
+    if (out_json) {
+        out_json->clear();
     }
-    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           (std::string{Common::ElfInfo::Instance().GameSerial()} + "-jobs.bin");
+    std::error_code ec;
+    auto sibling_json = [&](const std::filesystem::path& bin_path) {
+        if (!out_json) {
+            return;
+        }
+        auto json = bin_path;
+        json.replace_extension(".json");
+        if (std::filesystem::exists(json, ec)) {
+            *out_json = std::move(json);
+        }
+    };
+    for (const char* name : {"ISS_PRECOMPILE_JOBS", "TLG_PRECOMPILE_JOBS"}) {
+        if (const char* path = std::getenv(name); path && *path) {
+            std::filesystem::path resolved{path};
+            sibling_json(resolved);
+            return resolved;
+        }
+    }
+
+    std::vector<std::string> serials;
+    auto add_serial = [&](std::string s) {
+        if (s.empty() || s == "UNKNOWN") {
+            return;
+        }
+        if (std::find(serials.begin(), serials.end(), s) == serials.end()) {
+            serials.push_back(std::move(s));
+        }
+    };
+    add_serial(std::string{Common::ElfInfo::Instance().GameSerial()});
+    add_serial("CUSA00004");
+    add_serial("CUSA00223");
+
+    std::vector<std::filesystem::path> dirs;
+    auto add_dir = [&](const std::filesystem::path& d) {
+        if (d.empty()) {
+            return;
+        }
+        if (std::find(dirs.begin(), dirs.end(), d) == dirs.end()) {
+            dirs.push_back(d);
+        }
+    };
+    const auto cache_dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
+    const auto user_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
+    add_dir(cache_dir);
+    add_dir(Storage::GameCacheDir());
+    add_dir(user_dir / "cache");
+    add_dir(user_dir);
+    if (const char* gpu_user = std::getenv("TLG_GPU_USER_DIR"); gpu_user && *gpu_user) {
+        std::filesystem::path p{gpu_user};
+        add_dir(p / "cache");
+        add_dir(p);
+    }
+    for (const char* name : {"ISS_GAME_DIR", "TLG_GAME_DIR"}) {
+        if (const char* game_dir = std::getenv(name); game_dir && *game_dir) {
+            std::filesystem::path p{game_dir};
+            add_dir(p);
+            add_dir(p / "cache");
+        }
+    }
+#if defined(__ANDROID__)
+    add_dir("/sdcard/Download");
+    add_dir("/storage/emulated/0/Download");
+    add_dir("/sdcard");
+    add_dir("/storage/emulated/0");
+#endif
+
+    for (const auto& dir : dirs) {
+        for (const auto& serial : serials) {
+            const auto candidate = dir / (serial + "-jobs.bin");
+            if (std::filesystem::exists(candidate, ec)) {
+                sibling_json(candidate);
+                return candidate;
+            }
+        }
+    }
+
+    return cache_dir / (serials.front() + "-jobs.bin");
+}
+
+std::filesystem::path JobFile() {
+    return ResolveJobFile(nullptr);
 }
 
 bool ReadJobs(const std::filesystem::path& path, std::vector<Record>& records) {
@@ -380,12 +462,29 @@ void WriteSmallFile(const std::filesystem::path& path, const std::string& text) 
 } // namespace
 
 bool PipelineCache::PrecompileFirstStart(const std::function<void(u32 total)>& start,
-                                         const std::function<void(u32 done, u32 total)>& progress) {
-    const auto jobs = Precompile::JobFile();
+                                         const std::function<void(u32 done, u32 total)>& progress,
+                                         std::string* out_status) {
+    const auto set_status = [&](std::string_view value) {
+        if (out_status) {
+            *out_status = value;
+        }
+    };
+    std::filesystem::path jobs_json;
+    const auto jobs = Precompile::ResolveJobFile(&jobs_json);
     std::error_code ec;
-    if (!std::filesystem::exists(jobs, ec) || !EmulatorSettings.IsPipelineCacheEnabled() ||
-        EmulatorSettings.IsPipelineCacheArchived()) {
+    if (!std::filesystem::exists(jobs, ec)) {
+        set_status("missing_jobs");
         return false;
+    }
+    if (!EmulatorSettings.IsPipelineCacheEnabled() || EmulatorSettings.IsPipelineCacheArchived()) {
+        set_status("disabled");
+        return false;
+    }
+    if (!jobs_json.empty()) {
+        std::printf("Precompile: found job file %s (manifest %s)\n", jobs.string().c_str(),
+                    jobs_json.string().c_str());
+    } else {
+        std::printf("Precompile: found job file %s\n", jobs.string().c_str());
     }
     CheckCacheProfile(); // opens the cache; a rebuilt one has lost its done file too
     const auto folder = Storage::GameCacheDir();
@@ -403,10 +502,12 @@ bool PipelineCache::PrecompileFirstStart(const std::function<void(u32 total)>& s
                     instance.GetVendorID(), instance.GetDeviceID(), instance.GetDriverVersion(),
                     uuid_hash);
     if (ReadSmallFile(folder / Precompile::DoneFile) == fingerprint) {
+        set_status("up_to_date");
         return false;
     }
     std::vector<Precompile::Record> records;
     if (!Precompile::ReadJobs(jobs, records)) {
+        set_status("invalid_jobs");
         return false;
     }
     // A record that crashed the last start is skipped (it compiles in game, as before).
@@ -429,10 +530,12 @@ bool PipelineCache::PrecompileFirstStart(const std::function<void(u32 total)>& s
         WriteSmallFile(folder / Precompile::DoneFile, fingerprint);
         std::error_code remove_ec;
         std::filesystem::remove(folder / Precompile::ProgressFile, remove_ec);
+        set_status("gave_up");
         return false;
     }
     if (first >= records.size()) {
         WriteSmallFile(folder / Precompile::DoneFile, fingerprint);
+        set_status("up_to_date");
         return false;
     }
     records.erase(records.begin(), records.begin() + first);
@@ -466,6 +569,7 @@ bool PipelineCache::PrecompileFirstStart(const std::function<void(u32 total)>& s
                 released);
     WriteSmallFile(folder / Precompile::DoneFile, fingerprint);
     std::filesystem::remove(progress_path, ec);
+    set_status("compiled");
     return true;
 }
 
@@ -569,7 +673,11 @@ unsigned BuildThreads() {
             return u32(std::strtoul(value, nullptr, 10));
         }
     }
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+    return std::clamp(TlgThreads::Available() / 4, 1u, 2u);
+#else
     return std::max(1u, TlgThreads::Available() - 1);
+#endif
 }
 } // namespace
 
@@ -593,10 +701,17 @@ Precompile::Result PipelineCache::Precompile(
     std::vector<vk::UniquePipelineCache> caches;
     for (unsigned i = 0; i < threads; ++i) {
         auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-        if (cache_result != vk::Result::eSuccess) {
+        if (cache_result == vk::Result::eIncomplete) {
+            WarnIncomplete("Precompile createPipelineCacheUnique");
+        }
+        if (!IsVulkanOk(cache_result)) {
             break;
         }
-        if (instance.GetDevice().mergePipelineCaches(*cache, *pipeline_cache) != vk::Result::eSuccess) {
+        const auto merge_res = instance.GetDevice().mergePipelineCaches(*cache, *pipeline_cache);
+        if (merge_res == vk::Result::eIncomplete) {
+            WarnIncomplete("Precompile seed mergePipelineCaches");
+        }
+        if (!IsVulkanOk(merge_res)) {
             break;
         }
         caches.push_back(std::move(cache));
@@ -626,7 +741,12 @@ Precompile::Result PipelineCache::Precompile(
     };
     std::optional<BuildPool> pool;
     if (!caches.empty()) {
-        pool.emplace(u32(caches.size()), caches.size() * 4, build);
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+        const size_t queue_limit = caches.size() * 2;
+#else
+        const size_t queue_limit = caches.size() * 4;
+#endif
+        pool.emplace(u32(caches.size()), queue_limit, build);
     }
     std::printf("Precompile: building pipelines on %zu threads\n", caches.size());
     std::set<u32> in_flight; // records whose pipeline is being built
@@ -732,7 +852,8 @@ Precompile::Result PipelineCache::Precompile(
                     PlaceStage(*arena, record.stages[0], address, cs.user_data);
                     cs.address = address;
                 }
-                selection.regs = sel.regs;
+                regs->reg_array.fill(0);
+                selection.regs = regs.get();
                 selection.cs_regs = &cs;
                 ComputePipelineKey key{};
                 if (!RefreshComputeKey(selection, key)) {
@@ -766,6 +887,7 @@ Precompile::Result PipelineCache::Precompile(
             collect(std::move(one));
         }
     }
+    bool merged_or_built = false;
     if (pool) {
         pool->Finish();
         collect(pool->TakeDone());
@@ -775,10 +897,21 @@ Precompile::Result PipelineCache::Precompile(
         for (const auto& cache : caches) {
             sources.push_back(*cache);
         }
-        if (instance.GetDevice().mergePipelineCaches(*pipeline_cache, sources) !=
-            vk::Result::eSuccess) {
-            std::printf("Precompile: merging the build threads' pipeline caches failed\n");
+        const auto merge_res = instance.GetDevice().mergePipelineCaches(*pipeline_cache, sources);
+        if (merge_res == vk::Result::eIncomplete) {
+            WarnIncomplete("Precompile mergePipelineCaches");
         }
+        if (!IsVulkanOk(merge_res)) {
+            std::printf("Precompile: merging the build threads' pipeline caches failed (%s)\n",
+                        vk::to_string(merge_res).c_str());
+        } else {
+            merged_or_built = result.graphics > 0 || result.compute > 0;
+        }
+    } else {
+        merged_or_built = result.graphics > 0 || result.compute > 0;
+    }
+    if (merged_or_built) {
+        g_tlg_driver_pipelines_created.fetch_add(1, std::memory_order_relaxed);
     }
     if (progress) {
         progress(u32(records.size()), u32(records.size()));

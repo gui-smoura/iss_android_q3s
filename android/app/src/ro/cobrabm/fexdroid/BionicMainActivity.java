@@ -89,6 +89,20 @@ public final class BionicMainActivity extends Activity {
   int start=i+key.length()+1,end=summary.indexOf(' ',start);
   return end<0?summary.substring(start):summary.substring(start,end);
  }
+ private static int[] parseWarmupFraction(String line,String prefix){
+  if(line==null||!line.startsWith(prefix))return null;
+  String rest=line.substring(prefix.length()).trim();
+  int slash=rest.indexOf('/');
+  if(slash<=0)return null;
+  try{
+   int done=Integer.parseInt(rest.substring(0,slash).trim());
+   String right=rest.substring(slash+1).trim();
+   int sp=right.indexOf(' ');
+   int total=Integer.parseInt(sp<0?right:right.substring(0,sp));
+   if(total<=0)return null;
+   return new int[]{Math.max(0,Math.min(done,total)),total};
+  }catch(NumberFormatException ignored){return null;}
+ }
  private void precompileShaders(){
   if(busy)return;
   if(!access()||!gameReady()){beginSetup(true);return;}
@@ -114,23 +128,65 @@ public final class BionicMainActivity extends Activity {
     BionicRendererSettings.environment(getSharedPreferences("iss",0),e);
     java.lang.Process proc=pb.start();
     String summary=null;
+    long lastUiUpdateNs=0L;
     try(BufferedReader reader=new BufferedReader(new InputStreamReader(proc.getInputStream(),java.nio.charset.StandardCharsets.UTF_8));
         OutputStream out=new FileOutputStream(new File(filesDir,"iss.log"),false)){
      String line;
      while((line=reader.readLine())!=null){
       out.write((line+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
-      if(line.startsWith("Warmup-only: summary "))summary=line.substring("Warmup-only: summary ".length());
+      if(line.startsWith("Warmup-only: summary ")){
+       summary=line.substring("Warmup-only: summary ".length());
+       continue;
+      }
+      int[] frac=parseWarmupFraction(line,"Warmup-only: precompile ");
+      boolean isPrecompile=frac!=null;
+      if(frac==null)frac=parseWarmupFraction(line,"Warmup-only: pipeline cache ");
+      if(frac!=null){
+       final int done=frac[0],total=frac[1],pct=Math.round((done*100f)/total);
+       long now=System.nanoTime();
+       if(done==1||done==total||now-lastUiUpdateNs>=50_000_000L){
+        lastUiUpdateNs=now;
+        final String stepText=(isPrecompile
+         ?AppLanguage.text("Precompiling shaders: ", "Pré-compilando shaders: ")
+         :AppLanguage.text("Warming pipeline cache: ", "Aquecendo cache de pipelines: "))
+         +done+"/"+total+" ("+pct+"%)";
+        runOnUiThread(()->{
+         if(!busy)return;
+         if(progress!=null){progress.setIndeterminate(false);progress.setMax(total);progress.setProgress(done);}
+         status.setText(stepText);
+        });
+       }
+      }
      }
     }
     int code=proc.waitFor();
     String precompiled=warmupField(summary,"precompiled");
     String pipelines=warmupField(summary,"pipelines");
     String shaders=warmupField(summary,"shaders");
+    String jobStatus=warmupField(summary,"status");
     final String message;
     if(code!=0){
      message=AppLanguage.text("Shader precompilation exited (", "Pré-compilação de shaders encerrou (")+code+AppLanguage.text("). Export log.", "). Exporte o log.");
     }else if("0/0".equals(precompiled)&&"0/0".equals(pipelines)&&"0".equals(shaders)){
-     message=AppLanguage.text("No cached shaders found (0 on disk). Play once first.", "Nenhum shader em cache no disco (0 encontrados). Jogue uma vez antes.");
+     if("up_to_date".equals(jobStatus)){
+      message=AppLanguage.text("Shader cache is already up to date for this driver.", "O cache de shaders já está atualizado para este driver.");
+     }else if("gave_up".equals(jobStatus)){
+      message=AppLanguage.text("Precompilation paused after repeated driver failures; shaders will compile in game.", "Pré-compilação pausada após falhas repetidas do driver; os shaders serão compilados no jogo.");
+     }else if("invalid_jobs".equals(jobStatus)){
+      message=AppLanguage.text("Invalid shader job file (jobs.bin).", "Arquivo de jobs de shaders inválido (jobs.bin).");
+     }else if("missing_jobs".equals(jobStatus)){
+      message=AppLanguage.text("No cached shaders or jobs.bin found (0 on disk). Play once first or place CUSA00004-jobs.bin in Download or user/cache/.", "Nenhum shader ou jobs.bin encontrado (0 no disco). Jogue uma vez antes ou copie CUSA00004-jobs.bin em Download ou user/cache/.");
+     }else{
+      message=AppLanguage.text("No cached shaders found (0 on disk). Play once first.", "Nenhum shader em cache no disco (0 encontrados). Jogue uma vez antes.");
+     }
+    }else if("up_to_date".equals(jobStatus)){
+     String counts=(pipelines!=null&&shaders!=null)?" ("+pipelines+" pipelines, "+shaders+" shaders)":"";
+     message=AppLanguage.text("Shader cache is already up to date for this driver.", "O cache de shaders já está atualizado para este driver.")+counts;
+    }else if("gave_up".equals(jobStatus)){
+     String counts=(pipelines!=null&&shaders!=null)?" ("+pipelines+" pipelines, "+shaders+" shaders)":"";
+     message=AppLanguage.text("Precompilation paused after repeated driver failures; shaders will compile in game.", "Pré-compilação pausada após falhas repetidas do driver; os shaders serão compilados no jogo.")+counts;
+    }else if("compiled".equals(jobStatus)&&precompiled!=null&&pipelines!=null&&shaders!=null){
+     message=AppLanguage.text("Shader precompilation finished: ", "Pré-compilação de shaders concluída: ")+precompiled+" jobs, "+pipelines+" pipelines ("+shaders+" shaders).";
     }else if(pipelines!=null&&shaders!=null){
      message=AppLanguage.text("Shader precompilation finished: ", "Pré-compilação de shaders concluída: ")+pipelines+" pipelines ("+shaders+" shaders).";
     }else{
@@ -189,7 +245,7 @@ public final class BionicMainActivity extends Activity {
   try(BionicSession.Guard ignored=BionicSession.acquire(getFilesDir())){}catch(IOException e){status.setText(e.getMessage());return;}
   String path=getSharedPreferences("iss",0).getString("game_dir","");if(!new File(path,"eboot.bin").canRead()||!new File(path,"art").isDirectory()||!new File(path,"art").canRead()){status.setText(AppLanguage.text("Choose the inFAMOUS game folder containing eboot.bin and readable art/.","Escolha a pasta de inFAMOUS com eboot.bin e art/ acessível."));return;}
   setBusy(true);status.setText(AppLanguage.text("Preparing runtime…", "Preparando runtime…"));new Thread(()->{try{BionicRuntimeInstaller.install(this);runOnUiThread(()->{setBusy(false);refresh();startActivity(new Intent(this,BionicGameActivity.class).putExtra("game_dir",path));});}catch(Exception e){runOnUiThread(()->{setBusy(false);status.setText(e.toString());});}},"runtime-install").start();}
- private void setBusy(boolean value){busy=value;if(progress!=null)progress.setVisibility(value?android.view.View.VISIBLE:android.view.View.GONE);for(Button b:actions)b.setEnabled(!value);}
+ private void setBusy(boolean value){busy=value;if(progress!=null){if(value){progress.setIndeterminate(true);progress.setMax(100);progress.setProgress(0);}progress.setVisibility(value?android.view.View.VISIBLE:android.view.View.GONE);}for(Button b:actions)b.setEnabled(!value);}
  private File saves(){return new File(getFilesDir(),"issport/user/savedata");}
  private void chooseSave(boolean importing){
   if(busy)return;

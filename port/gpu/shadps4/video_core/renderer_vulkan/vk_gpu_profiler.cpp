@@ -78,7 +78,7 @@ void GpuProfiler::Collect(u32 which) {
     const auto result = device.getQueryPoolResults(
         *pool, which * SliceQueries, count, count * sizeof(u64), stamps.data(), sizeof(u64),
         vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-    if (result != vk::Result::eSuccess) {
+    if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
         return;
     }
     for (u32 i = 0; i + 1 < count; ++i) {

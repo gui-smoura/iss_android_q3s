@@ -5,6 +5,7 @@
 #include "tlg_settings.h"
 #include <cstdlib>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include "tlg_copy.h"
 #ifndef _WIN32
@@ -40,6 +41,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_precompile.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -321,39 +323,76 @@ extern "C" int tlggpu_warmup_only(const TlgGpuConfig* config) {
         Vulkan::Scheduler scheduler{instance, false};
         // Default 16 KiB sparse page shift (14) matches BufferCache on Adreno/Turnip.
         Vulkan::PipelineCache cache{instance, scheduler, nullptr, 14};
+        std::filesystem::path jobs_json;
+        const auto jobs_path = Vulkan::Precompile::ResolveJobFile(&jobs_json);
+        std::error_code ec;
+        if (std::filesystem::exists(jobs_path, ec)) {
+            if (!jobs_json.empty()) {
+                std::printf("Warmup-only: jobs=%s (json=%s)\n", jobs_path.string().c_str(),
+                            jobs_json.string().c_str());
+            } else {
+                std::printf("Warmup-only: jobs=%s\n", jobs_path.string().c_str());
+            }
+            std::fflush(stdout);
+        }
         u32 precompile_done = 0;
         u32 precompile_total = 0;
-        cache.PrecompileFirstStart(
+        u32 last_precompile_reported = 0;
+        std::string precompile_status;
+        const bool precompiled = cache.PrecompileFirstStart(
             [&](u32 total) {
                 precompile_total = total;
+                last_precompile_reported = 0;
                 std::printf("Warmup-only: precompiling %u job records\n", total);
                 std::fflush(stdout);
             },
             [&](u32 done, u32 total) {
                 precompile_done = done;
                 precompile_total = total;
-                if (done == total || (done % 16) == 0) {
+                if (done == 1 || done == total || done >= last_precompile_reported + 8) {
+                    last_precompile_reported = done;
                     std::printf("Warmup-only: precompile %u / %u\n", done, total);
                     std::fflush(stdout);
                 }
-            });
+            },
+            &precompile_status);
+        if (!precompile_status.empty()) {
+            std::printf("Warmup-only: status %s\n", precompile_status.c_str());
+            std::fflush(stdout);
+        }
+        const bool jobs_covered = precompiled || precompile_status == "up_to_date" ||
+                                  precompile_status == "gave_up";
         u32 last_reported = 0;
         u32 warmup_done = 0;
         u32 warmup_total = 0;
-        cache.WarmUp([&](u32 done, u32 total) {
-            warmup_done = done;
-            warmup_total = total;
-            if (done == total || done >= last_reported + 16) {
-                last_reported = done;
-                std::printf("Warmup-only: pipeline cache %u / %u\n", done, total);
-                std::fflush(stdout);
+        if (jobs_covered) {
+            // Job-file precompilation populates the Vulkan driver cache and releases live pipeline
+            // handles as it goes; running WarmUp afterwards would re-compile everything at once
+            // and retain gigabytes of VkPipeline objects in RAM (fatal on 8 GB Quest 3S).
+            if (Storage::DataBase::Instance().IsOpened()) {
+                Storage::DataBase::Instance().WaitIdle();
+                Storage::DataBase::Instance().FinishPreload();
             }
-        });
+        } else {
+            cache.WarmUp([&](u32 done, u32 total) {
+                warmup_done = done;
+                warmup_total = total;
+                if (done == 1 || done == total || done >= last_reported + 16) {
+                    last_reported = done;
+                    std::printf("Warmup-only: pipeline cache %u / %u\n", done, total);
+                    std::fflush(stdout);
+                }
+            });
+        }
         size_t shader_blobs = 0;
         size_t pipeline_blobs = 0;
         if (Storage::DataBase::Instance().IsOpened()) {
             shader_blobs = Storage::DataBase::Instance().CountBlobs(Storage::BlobType::ShaderBinary);
             pipeline_blobs = Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey);
+        }
+        if (jobs_covered) {
+            warmup_total = u32(pipeline_blobs);
+            warmup_done = u32(pipeline_blobs);
         }
         const size_t pipelines_total = std::max(size_t(warmup_total), pipeline_blobs);
         const bool saved = cache.SaveDriverCache();
@@ -364,9 +403,11 @@ extern "C" int tlggpu_warmup_only(const TlgGpuConfig* config) {
                         cache_dir.c_str());
         }
         std::printf("Warmup-only: summary precompiled=%u/%u pipelines=%u/%zu shaders=%zu "
-                    "driver_cache_saved=%d (%s)\n",
+                    "driver_cache_saved=%d status=%s (%s)\n",
                     precompile_done, precompile_total, warmup_done, pipelines_total, shader_blobs,
-                    int(saved), instance.GetDriverVersionName().c_str());
+                    int(saved),
+                    precompile_status.empty() ? "unknown" : precompile_status.c_str(),
+                    instance.GetDriverVersionName().c_str());
         std::fflush(stdout);
         return 0;
     } catch (const std::exception& e) {

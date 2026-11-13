@@ -309,6 +309,12 @@ final class LanguageCatalogTrPl {
   {"Shader precompilation exited (","Gölgelendirici ön derlemesi çıkış yaptı (","Wstępna kompilacja shaderów zakończyła się ("},
   {"Invalid driver library name","Geçersiz sürücü kitaplığı adı","Nieprawidłowa nazwa biblioteki sterownika"},
   {"Driver ZIP is missing meta.json or a .so library","Sürücü ZIP'inde meta.json veya .so kitaplığı yok","W ZIP sterownika brakuje meta.json lub biblioteki .so"},
+  {"Precompiling shaders: ","Gölgelendiriciler önceden derleniyor: ","Wstępna kompilacja shaderów: "},
+  {"Warming pipeline cache: ","İşlem hattı önbelleği ısıtılıyor: ","Rozgrzewanie pamięci podręcznej potoków: "},
+  {"Shader cache is already up to date for this driver.","Bu sürücü için gölgelendirici önbelleği zaten güncel.","Pamięć podręczna shaderów dla tego sterownika jest już aktualna."},
+  {"Precompilation paused after repeated driver failures; shaders will compile in game.","Tekrarlanan sürücü hataları nedeniyle ön derleme duraklatıldı; gölgelendiriciler oyunda derlenecek.","Wstępna kompilacja wstrzymana po powtarzających się błędach sterownika; shadery zostaną skompilowane w grze."},
+  {"Invalid shader job file (jobs.bin).","Geçersiz gölgelendirici görev dosyası (jobs.bin).","Nieprawidłowy plik zadań shaderów (jobs.bin)."},
+  {"No cached shaders or jobs.bin found (0 on disk). Play once first or place CUSA00004-jobs.bin in Download or user/cache/.","Önbellekte gölgelendirici veya jobs.bin bulunamadı (diskte 0). Önce bir kez oynayın ya da CUSA00004-jobs.bin dosyasını Download veya user/cache/ içine koyun.","Nie znaleziono zapisanych shaderów ani pliku jobs.bin (0 na dysku). Zagraj najpierw raz lub umieść CUSA00004-jobs.bin w Download albo user/cache/."},
   };
   for(String[] row:rows)TEXT.put(row[0],new String[]{row[1],row[2]});
  }
