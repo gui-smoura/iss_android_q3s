@@ -99,6 +99,7 @@ int main() {
             ("// PRODUCTION_MAPPING_TYPE", "struct ResidencyMapping {"),
             ("// PRODUCTION_BACKING_TYPE", "struct Backing : public Interval {"),
             ("// PRODUCTION_ATTEMPT_TYPE", "struct ResidencyAttempt {"),
+            ("// PRODUCTION_ALLOCATION_TYPE", "struct ResidencyAllocation {"),
         ):
             code = code.replace(marker, method(header, signature) + ";")
         code = code.replace("// PRODUCTION_REQUIRE_BARRIER", method(
@@ -115,6 +116,7 @@ int main() {
             "std::shared_ptr<BufferCache::DeferredReadback> BufferCache::StartDeferredReadback(",
             "bool BufferCache::FinishDeferredReadback(", "void BufferCache::RecoverDeferredReadback(",
             "void BufferCache::SettleDeferredReadbacks(", "void BufferCache::PruneDeferredReadbacks()",
+            "u64 BufferCache::MemoryKey(",
             "std::optional<std::pair<vk::DeviceMemory, u64>> BufferCache::AllocateResidency(",
             "void BufferCache::UndoResidency(",
         )

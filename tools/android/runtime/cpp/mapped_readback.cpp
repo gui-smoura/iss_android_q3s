@@ -1,6 +1,7 @@
 // Real buffer-cache readback methods and real Vulkan-Hpp, with delayed device completion.
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cstring>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <string>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "common/interval_set.h"
@@ -182,15 +184,19 @@ struct BufferCache {
     // PRODUCTION_MAPPING_TYPE
     // PRODUCTION_BACKING_TYPE
     // PRODUCTION_ATTEMPT_TYPE
+    // PRODUCTION_ALLOCATION_TYPE
     Vulkan::Instance instance;Vulkan::Scheduler scheduler;Runtime runtime;Pool staging_pool;
     Tracker tracker;Tracker* memory_tracker=&tracker;Memory mem;Memory* memory=&mem;
     Buffer arena;Ranges gpu_modified_ranges;IntervalList<Backing> resident_ranges;
     WriteTickTracker write_ticks;
     std::map<vk::DeviceMemory,ResidencyMapping> residency_mappings;
+    std::unordered_map<u64,ResidencyAllocation> residency_allocations_map;
     bool mapped_readbacks_enabled=true,residency_coherent=true;
     u32 block_shift=14;
     u32 arena_memory_type_index=2;
     vk::DeviceMemory residency_chunk{};u64 residency_chunk_used=0,residency_allocations=0;
+    u64 residency_total_bytes=0,residency_gc_tick=1;
+    static u64 MemoryKey(vk::DeviceMemory) noexcept;
     std::optional<std::pair<vk::DeviceMemory,u64>> AllocateResidency(u64,ResidencyAttempt&);
     void UndoResidency(const ResidencyAttempt&);
     HybridStagingWindow hybrid_staging_hot_pages;
@@ -268,10 +274,19 @@ int main(int argc,char** argv) {
         auto memory=c.AllocateResidency(16384,attempt);assert(memory && memory->second==0);
         auto& mapping=c.residency_mappings.at(memory->first);
         assert(mapping.size==(256ull<<20) && !mapping.data && !mapping.failed);
+        const u64 mem_key=VideoCore::BufferCache::MemoryKey(memory->first);
+        assert(c.residency_allocations_map.size()==1 && c.residency_total_bytes==(256ull<<20));
+        assert(c.residency_allocations_map.at(mem_key).last_used_tick==1);
+        ++c.residency_gc_tick;
+        auto second=c.AllocateResidency(16384,attempt);
+        assert(second && second->first==memory->first && second->second==16384);
+        assert(c.residency_allocations_map.at(mem_key).last_used_tick==2);
         mapping.data=reinterpret_cast<const u8*>(1); // cleanup must unmap before free/erase
         c.UndoResidency(attempt);
-        assert(c.residency_mappings.empty() && c.residency_allocations==0 && !c.residency_chunk);
+        assert(c.residency_mappings.empty() && c.residency_allocations_map.empty() &&
+               c.residency_total_bytes==0 && c.residency_allocations==0 && !c.residency_chunk);
         assert((allocation_events==std::vector<std::string>{"allocate","unmap","free"}));
+        c.residency_gc_tick=1;
     }
     c.scheduler.FlushHostReadBarrier();assert(barriers==0);
     c.scheduler.RequireHostReadBarrier();c.scheduler.RequireHostReadBarrier();
