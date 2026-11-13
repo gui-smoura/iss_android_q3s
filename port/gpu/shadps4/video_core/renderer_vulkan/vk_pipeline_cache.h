@@ -211,6 +211,9 @@ public:
         return profile;
     }
 
+    /// tlg: BP08, flush the driver's VkPipelineCache blob to disk.
+    bool SaveDriverCache();
+
 private:
     bool QueueShader(Program& program, Shader::HwStage stage, Shader::SwStage l_stage,
                      const Shader::ShaderParams& params, Shader::RuntimeInfo runtime_info,
@@ -222,7 +225,6 @@ private:
     /// tlg: BP08, the driver's VkPipelineCache blob kept between sessions (see the .cpp).
     void StartDriverCacheSaver();
     void StopDriverCacheSaver();
-    bool SaveDriverCache();
     bool SaveDriverCacheUnchecked();
     void SeedWorkerCaches();
     bool CheckCacheProfile();

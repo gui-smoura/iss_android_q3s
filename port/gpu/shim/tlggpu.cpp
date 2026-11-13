@@ -37,7 +37,10 @@
 #include "core/emulator_settings.h"
 #include "core/signals.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 extern "C" {
 // runtime_memory.c
