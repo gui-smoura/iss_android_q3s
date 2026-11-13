@@ -44,7 +44,9 @@ mkdir -p "$TMPDIR" "$HOME/.fex-emu" "$HOME/.cache/fex-emu" "$base/user" "$base/o
 [ -x "$probe" ] || { echo "Bionic inFAMOUS probe missing" >&2; exit 127; }
 chip=$("$runtime/bin/kgsl-chip-id" 2>/dev/null || true)
 # Family-aware defaults: Gen8 on 8xx; v27 R1 on 6xx/7xx; system elsewhere.
-case "${ISS_BIONIC_DRIVER:-auto}" in
+export ISS_BIONIC_DRIVER="${ISS_BIONIC_DRIVER:-${TLG_BIONIC_DRIVER:-auto}}"
+export TLG_BIONIC_DRIVER="$ISS_BIONIC_DRIVER"
+case "$ISS_BIONIC_DRIVER" in
  gen8) export ISS_VULKAN_DRIVER="$runtime/drivers/gen8/libvulkan_freedreno.so" ;;
  gen7) export ISS_VULKAN_DRIVER="$runtime/drivers/gen7/libvulkan_freedreno.so" ;;
  custom)

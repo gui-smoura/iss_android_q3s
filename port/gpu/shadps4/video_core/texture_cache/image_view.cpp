@@ -156,15 +156,21 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
 
     static const bool drop_mip0_env = [] {
         const char* env = std::getenv("TLG_DROP_MIP0");
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+        return !(env && env[0] == '0');
+#else
         return env && env[0] == '1';
+#endif
     }();
     u32 view_base_mip = info.range.base.level;
     u32 view_level_count = info.range.extent.levels;
     if (drop_mip0_env && image.info.resources.levels > 1 && image.info.props.is_block &&
-        !image.info.props.is_depth && False(image.flags & ImageFlagBits::GpuModified) &&
-        view_base_mip == 0 && view_level_count > 1) {
+        !image.info.props.is_bc_decoded && !image.info.props.is_depth &&
+        False(image.flags & ImageFlagBits::GpuModified) && view_base_mip == 0) {
         view_base_mip = 1;
-        view_level_count -= 1;
+        if (view_level_count > 1) {
+            view_level_count -= 1;
+        }
     }
 
     const vk::ImageViewCreateInfo image_view_ci = {

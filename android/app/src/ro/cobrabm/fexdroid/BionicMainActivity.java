@@ -82,6 +82,13 @@ public final class BionicMainActivity extends Activity {
    status.setText(AppLanguage.text("Shader and pipeline cache cleared.", "Cache de shaders e pipelines limpo."));
   }catch(Exception e){status.setText(e.getMessage());}
  }
+ private static String warmupField(String summary,String key){
+  if(summary==null)return null;
+  int i=summary.indexOf(key+"=");
+  if(i<0)return null;
+  int start=i+key.length()+1,end=summary.indexOf(' ',start);
+  return end<0?summary.substring(start):summary.substring(start,end);
+ }
  private void precompileShaders(){
   if(busy)return;
   if(!access()||!gameReady()){beginSetup(true);return;}
@@ -97,21 +104,41 @@ public final class BionicMainActivity extends Activity {
     java.util.Map<String,String> e=pb.environment();
     e.put("FXD_FILES",filesDir.getPath());
     e.put("ISS_GAME_DIR",path);
+    e.put("ISS_APP_LANGUAGE",AppLanguage.gameLanguage());
     e.put("ISS_BIONIC","1");
     e.put("ISS_WARMUP_ONLY","1");
-    e.put("ISS_BIONIC_DRIVER",BionicDriverSettings.selection(this));
+    String selectedDriver=BionicDriverSettings.selection(this);
+    e.put("ISS_BIONIC_DRIVER",selectedDriver);
+    e.put("TLG_BIONIC_DRIVER",selectedDriver);
     e.put("ISS_CUSTOM_DRIVER",BionicDriverSettings.customLibrary(this).getPath());
     BionicRendererSettings.environment(getSharedPreferences("iss",0),e);
     java.lang.Process proc=pb.start();
-    try(InputStream in=proc.getInputStream();OutputStream out=new FileOutputStream(new File(filesDir,"iss.log"),false)){
-     byte[] buf=new byte[8192];int n;while((n=in.read(buf))>0)out.write(buf,0,n);
+    String summary=null;
+    try(BufferedReader reader=new BufferedReader(new InputStreamReader(proc.getInputStream(),java.nio.charset.StandardCharsets.UTF_8));
+        OutputStream out=new FileOutputStream(new File(filesDir,"iss.log"),false)){
+     String line;
+     while((line=reader.readLine())!=null){
+      out.write((line+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      if(line.startsWith("Warmup-only: summary "))summary=line.substring("Warmup-only: summary ".length());
+     }
     }
     int code=proc.waitFor();
+    String precompiled=warmupField(summary,"precompiled");
+    String pipelines=warmupField(summary,"pipelines");
+    String shaders=warmupField(summary,"shaders");
+    final String message;
+    if(code!=0){
+     message=AppLanguage.text("Shader precompilation exited (", "Pré-compilação de shaders encerrou (")+code+AppLanguage.text("). Export log.", "). Exporte o log.");
+    }else if("0/0".equals(precompiled)&&"0/0".equals(pipelines)&&"0".equals(shaders)){
+     message=AppLanguage.text("No cached shaders found (0 on disk). Play once first.", "Nenhum shader em cache no disco (0 encontrados). Jogue uma vez antes.");
+    }else if(pipelines!=null&&shaders!=null){
+     message=AppLanguage.text("Shader precompilation finished: ", "Pré-compilação de shaders concluída: ")+pipelines+" pipelines ("+shaders+" shaders).";
+    }else{
+     message=AppLanguage.text("Shader precompilation finished.", "Pré-compilação de shaders concluída.");
+    }
     runOnUiThread(()->{
      setBusy(false);
-     status.setText(code==0
-      ? AppLanguage.text("Shader precompilation finished.", "Pré-compilação de shaders concluída.")
-      : AppLanguage.text("Shader precompilation exited (", "Pré-compilação de shaders encerrou (")+code+AppLanguage.text("). Export log.", "). Exporte o log."));
+     status.setText(message);
     });
    }catch(Exception ex){
     runOnUiThread(()->{setBusy(false);status.setText(ex.toString());});

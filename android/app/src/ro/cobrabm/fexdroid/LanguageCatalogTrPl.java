@@ -304,6 +304,8 @@ final class LanguageCatalogTrPl {
   {"Precompile shaders","Gölgelendiricileri önceden derle","Wstępnie kompiluj shadery"},
   {"Precompiling shaders on selected driver…","Seçili sürücüde gölgelendiriciler önceden derleniyor…","Wstępna kompilacja shaderów na wybranym sterowniku…"},
   {"Shader precompilation finished.","Gölgelendirici ön derlemesi tamamlandı.","Wstępna kompilacja shaderów zakończona."},
+  {"Shader precompilation finished: ","Gölgelendirici ön derlemesi tamamlandı: ","Wstępna kompilacja shaderów zakończona: "},
+  {"No cached shaders found (0 on disk). Play once first.","Önbellekte gölgelendirici bulunamadı (diskte 0). Önce bir kez oynayın.","Nie znaleziono zapisanych shaderów (0 na dysku). Najpierw zagraj raz."},
   {"Shader precompilation exited (","Gölgelendirici ön derlemesi çıkış yaptı (","Wstępna kompilacja shaderów zakończyła się ("},
   {"Invalid driver library name","Geçersiz sürücü kitaplığı adı","Nieprawidłowa nazwa biblioteki sterownika"},
   {"Driver ZIP is missing meta.json or a .so library","Sürücü ZIP'inde meta.json veya .so kitaplığı yok","W ZIP sterownika brakuje meta.json lub biblioteki .so"},

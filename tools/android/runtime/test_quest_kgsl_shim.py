@@ -422,18 +422,36 @@ int main(int argc, char** argv) {
 
         mem_c = (ROOT / "port/src/runtime_memory.c").read_text()
         self.assertIn("ISS_DIRECT_MEM_MB", mem_c)
+        self.assertIn("mb = 4608;", mem_c)
         self.assertIn("direct_mem.bin", mem_c)
         self.assertIn("unlink(path);", mem_c)
+
+        tex_cpp = (
+            ROOT / "port/gpu/shadps4/video_core/texture_cache/texture_cache.cpp"
+        ).read_text()
+        view_cpp = (
+            ROOT / "port/gpu/shadps4/video_core/texture_cache/image_view.cpp"
+        ).read_text()
+        self.assertIn("TLG_DROP_MIP0", tex_cpp)
+        self.assertIn("TLG_DROP_MIP0", view_cpp)
+        self.assertIn("ISS_ANDROID_BIONIC", tex_cpp)
+        self.assertIn("ISS_ANDROID_BIONIC", view_cpp)
 
         probe_c = (ROOT / "port/src/probe.c").read_text()
         self.assertIn("--warmup-only", probe_c)
         self.assertIn("tlggpu_warmup_only(&gpu)", probe_c)
+        self.assertLess(
+            probe_c.index("tlggpu_warmup_only(&gpu)"),
+            probe_c.index("guest_cpu_init(runtime_low_map)"),
+        )
 
         main_java = (
             ROOT / "android/app/src/ro/cobrabm/fexdroid/BionicMainActivity.java"
         ).read_text()
         self.assertIn("Pré-compilar Shaders", main_java)
         self.assertIn("precompileShaders", main_java)
+        self.assertIn("TLG_BIONIC_DRIVER", main_java)
+        self.assertIn("Warmup-only: summary ", main_java)
 
         # QGL segfaults on ANY @llvm.qgpu.atomic.*.oob.p3i32.i32 intrinsic on Workgroup memory.
         self.assertNotIn("ctx.OpAtomicLoad(", atomic_cpp)

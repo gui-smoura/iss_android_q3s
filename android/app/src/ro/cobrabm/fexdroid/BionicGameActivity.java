@@ -101,7 +101,9 @@ public final class BionicGameActivity extends Activity implements SurfaceHolder.
   e.put("ISS_GAME_DIR",getIntent().getStringExtra("game_dir"));
   e.put("ISS_APP_LANGUAGE",AppLanguage.gameLanguage());
   e.put("ISS_BIONIC","1");e.put("ISS_ANDROID_INPUT","1");
-  e.put("ISS_BIONIC_DRIVER",BionicDriverSettings.selection(this));
+  String selectedDriver=BionicDriverSettings.selection(this);
+  e.put("ISS_BIONIC_DRIVER",selectedDriver);
+  e.put("TLG_BIONIC_DRIVER",selectedDriver);
   e.put("ISS_CUSTOM_DRIVER",BionicDriverSettings.customLibrary(this).getPath());
   String outputResolution=BionicVideoSettings.outputResolution(getSharedPreferences("iss",0));
   String[] dimensions=outputResolution.split("x");

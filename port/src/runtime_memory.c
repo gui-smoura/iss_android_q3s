@@ -25,8 +25,9 @@
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. TLG_DMEM_MB raises it (the resolution
  * patches above 1080p need about 4 GiB more; run.sh sets it).
- * On Android Bionic (Quest 3S 8 GB RAM), ISS_DIRECT_MEM_MB (default 3072 MiB) caps what is
- * reported so the game streams within physical memory headroom instead of reserving ~5 GiB. */
+ * On Android Bionic (Quest 3S 8 GB RAM), ISS_DIRECT_MEM_MB (default 4608 MiB) caps what is
+ * reported while leaving >=2.8 GiB for the type=3 arena; backed by a sparse UFS file so
+ * untouched pages consume zero physical RAM. */
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
@@ -34,7 +35,7 @@ static uint64_t pool_size_bytes(void) {
         if (!env || !*env) env = getenv("TLG_DMEM_MB");
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
 #ifdef __ANDROID__
-        if (mb < 1024 || mb > 16384) mb = 3072;
+        if (mb < 1024 || mb > 16384) mb = 4608;
 #else
         if (mb < 5056 || mb > 16384) mb = 5056;
 #endif

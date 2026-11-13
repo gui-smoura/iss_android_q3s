@@ -1522,7 +1522,11 @@ void TextureCache::RefreshImage(Image& image) {
     }
     static const bool drop_mip0_env = [] {
         const char* env = std::getenv("TLG_DROP_MIP0");
+#if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
+        return !(env && env[0] == '0');
+#else
         return env && env[0] == '1';
+#endif
     }();
     const bool skip_mip0 = drop_mip0_env && num_mips > 1 && image.info.props.is_block &&
                            !is_gpu_modified && !image.info.props.is_depth;
