@@ -30,7 +30,7 @@ void EmitBarrier(EmitContext& ctx) {
         // iss: LDS moved to a storage buffer (SharedMemoryToStoragePass) is UniformMemory.
         for (const auto& buffer : ctx.info.buffers) {
             if (buffer.buffer_type == BufferType::SharedMemory) {
-                memory_semantics |= spv::MemorySemanticsMask::UniformMemory;
+                memory_semantics = memory_semantics | spv::MemorySemanticsMask::UniformMemory;
                 break;
             }
         }
