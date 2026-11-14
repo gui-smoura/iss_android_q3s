@@ -65,10 +65,8 @@ void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute) {
         return;
     }
-    const bool will_use_storage_buffer =
-        profile.needs_shared_atomics_to_storage ||
-        program.info.cs.shared_memory_size > profile.max_shared_memory_size;
-    if (profile.supports_workgroup_explicit_memory_layout && !will_use_storage_buffer) {
+    if (profile.supports_workgroup_explicit_memory_layout &&
+        !profile.needs_shared_atomics_to_storage) {
         return;
     }
 
