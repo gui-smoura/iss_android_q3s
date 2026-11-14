@@ -246,7 +246,7 @@ int main() {{
 
     constexpr bool bionic = {int(bionic)};
     assert(PolicyGranule_ResidencyGranuleSize() == (bionic ? (4ull << 20) : (16ull << 20)));
-    assert(PolicyBudget_ResidencyBudgetBytes() == (bionic ? (1024ull << 20) : 0ull));
+    assert(PolicyBudget_ResidencyBudgetBytes() == (bionic ? (640ull << 20) : 0ull));
 
     // ISS_* takes precedence over TLG_*, non-powers floor, clamped [1, 64] MiB.
     setenv("TLG_RESIDENCY_GRANULE_MB", "32", 1);

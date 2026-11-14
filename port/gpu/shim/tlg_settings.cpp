@@ -13,14 +13,68 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace TlgSettings {
 
 namespace {
 
 const char* Path() {
-    const char* env = std::getenv("TLG_CONFIG");
-    return env && env[0] ? env : "tlg.ini";
+    if (const char* env = std::getenv("TLG_CONFIG"); env && env[0]) {
+        return env;
+    }
+    if (const char* env = std::getenv("ISS_CONFIG"); env && env[0]) {
+        return env;
+    }
+    return "tlg.ini";
+}
+
+std::vector<std::string> CandidateReadPaths() {
+    std::vector<std::string> paths;
+    auto add = [&](const std::string& p) {
+        if (p.empty()) {
+            return;
+        }
+        if (std::find(paths.begin(), paths.end(), p) == paths.end()) {
+            paths.push_back(p);
+        }
+    };
+    add(Path());
+    for (const char* env_name : {"TLG_GPU_USER_DIR", "ISS_GAME_DIR", "TLG_GAME_DIR"}) {
+        if (const char* dir = std::getenv(env_name); dir && dir[0]) {
+            std::string base{dir};
+            while (!base.empty() && (base.back() == '/' || base.back() == '\\')) {
+                base.pop_back();
+            }
+            add(base + "/config.ini");
+            add(base + "/tlg.ini");
+        }
+    }
+    add("config.ini");
+    return paths;
+}
+
+void ExportEnvPair(const std::string& key, const std::string& value) {
+    if (key.empty() || value.empty()) {
+        return;
+    }
+#ifdef _WIN32
+    if (!std::getenv(key.c_str())) {
+        _putenv_s(key.c_str(), value.c_str());
+    }
+    if (key.rfind("ISS_", 0) == 0 && key.size() > 4) {
+        const std::string tlg_key = "TLG_" + key.substr(4);
+        if (!std::getenv(tlg_key.c_str())) {
+            _putenv_s(tlg_key.c_str(), value.c_str());
+        }
+    }
+#else
+    setenv(key.c_str(), value.c_str(), 0);
+    if (key.rfind("ISS_", 0) == 0 && key.size() > 4) {
+        const std::string tlg_key = "TLG_" + key.substr(4);
+        setenv(tlg_key.c_str(), value.c_str(), 0);
+    }
+#endif
 }
 
 float Clamp(float v, float lo, float hi) {
@@ -28,6 +82,10 @@ float Clamp(float v, float lo, float hi) {
 }
 
 void Set(Values& v, const std::string& key, const std::string& value) {
+    if (key.rfind("ISS_", 0) == 0 || key.rfind("TLG_", 0) == 0) {
+        ExportEnvPair(key, value);
+        return;
+    }
     const float f = float(std::atof(value.c_str()));
     const int i = std::atoi(value.c_str());
     static const char* const overlay_keys[] = {"overlay_fps", "overlay_frametime", "overlay_upscaler",
@@ -235,19 +293,49 @@ void PollAndroidPerformance() {
 
 void Load() {
     auto& v = Get();
-    if (FILE* file = std::fopen(Path(), "r")) {
-        char line[1024]; // key_map can be long
-        while (std::fgets(line, sizeof(line), file)) {
-            std::string text{line};
-            text.erase(text.find_last_not_of(" \t\r\n") + 1);
-            const auto eq = text.find('=');
-            if (text.empty() || text[0] == '#' || eq == std::string::npos) {
-                continue;
-            }
-            Set(v, text.substr(0, eq), text.substr(eq + 1));
+    bool loaded_primary = false;
+    const std::string primary = Path();
+    for (const auto& candidate : CandidateReadPaths()) {
+        const bool is_game_override =
+            candidate != primary &&
+            ((std::getenv("ISS_GAME_DIR") && candidate.rfind(std::getenv("ISS_GAME_DIR"), 0) == 0) ||
+             (std::getenv("TLG_GAME_DIR") && candidate.rfind(std::getenv("TLG_GAME_DIR"), 0) == 0));
+        if (loaded_primary && !is_game_override) {
+            continue;
         }
-        std::fclose(file);
-        std::printf("Settings: %s\n", Path());
+        if (FILE* file = std::fopen(candidate.c_str(), "r")) {
+            char line[1024]; // key_map can be long
+            while (std::fgets(line, sizeof(line), file)) {
+                std::string text{line};
+                const auto last_non_ws = text.find_last_not_of(" \t\r\n");
+                if (last_non_ws != std::string::npos) {
+                    text.erase(last_non_ws + 1);
+                } else {
+                    text.clear();
+                }
+                const auto first_non_ws = text.find_first_not_of(" \t");
+                if (first_non_ws != std::string::npos && first_non_ws > 0) {
+                    text.erase(0, first_non_ws);
+                }
+                const auto eq = text.find('=');
+                if (text.empty() || text[0] == '#' || text[0] == ';' || text[0] == '[' ||
+                    eq == std::string::npos) {
+                    continue;
+                }
+                std::string k = text.substr(0, eq);
+                std::string val = text.substr(eq + 1);
+                if (const auto ke = k.find_last_not_of(" \t"); ke != std::string::npos) {
+                    k.erase(ke + 1);
+                }
+                if (const auto vs = val.find_first_not_of(" \t"); vs != std::string::npos) {
+                    val.erase(0, vs);
+                }
+                Set(v, k, val);
+            }
+            std::fclose(file);
+            std::printf("Settings: %s\n", candidate.c_str());
+            loaded_primary = true;
+        }
     }
     // Environment overrides (scripts, A/B tests).
     if (const char* env = std::getenv("TLG_UPSCALER")) {

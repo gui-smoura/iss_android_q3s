@@ -650,9 +650,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .block1d_as_2d = AmdGpu::Block1DAs2D(),
         .bc_tiny_decode = AmdGpu::BcTinyDecode(),
         .fragment_contraction_policy = Shader::Backend::SPIRV::FragmentContractionEnabled(),
-        // iss: compute shaders with LDS atomics get their LDS as a storage buffer with native
-        // buffer atomics on Qualcomm; the non-atomic CAS fallback only stays on by default if
-        // LDS-to-SSBO is explicitly disabled via ISS_QCOM_LDS_TO_SSBO=0 / TLG_LDS_TO_SSBO=0.
+        // iss: on Qualcomm Adreno (libllvm-qgl.so), keep LDS in hardware Workgroup memory and
+        // lower shared atomics to non-atomic OpLoad + OpStore by default so shaders mixing
+        // ds_read_b64/ds_write_b64 and 32-bit atomics compile natively and indirect dispatches
+        // never need 64 MiB StreamBuffer memsets. Set ISS_QCOM_LDS_TO_SSBO=1 / TLG_LDS_TO_SSBO=1
+        // to opt into lowering LDS to a storage buffer instead.
         .needs_shared_atomic_minmax_cas = [&] {
             if (const char* env = std::getenv("TLG_LDS_ATOMIC_CAS")) {
                 return env[0] != '0';
@@ -662,24 +664,24 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             const bool lds_to_ssbo = [&] {
                 if (const char* env = std::getenv("TLG_LDS_TO_SSBO")) {
-                    return env[0] != '0';
+                    return env[0] == '1';
                 }
                 if (const char* env = std::getenv("ISS_QCOM_LDS_TO_SSBO")) {
-                    return env[0] != '0';
+                    return env[0] == '1';
                 }
-                return instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
+                return false;
             }();
             return !lds_to_ssbo &&
                    instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
         }(),
         .needs_shared_atomics_to_storage = [&] {
             if (const char* env = std::getenv("TLG_LDS_TO_SSBO")) {
-                return env[0] != '0';
+                return env[0] == '1';
             }
             if (const char* env = std::getenv("ISS_QCOM_LDS_TO_SSBO")) {
-                return env[0] != '0';
+                return env[0] == '1';
             }
-            return instance.GetDriverID() == vk::DriverId::eQualcommProprietary;
+            return false;
         }(),
     };
     // tlg: the recompiler switches (ISS_ names arrive as TLG_), one line each on stdout (the run
@@ -1016,9 +1018,11 @@ void PipelineCache::PublishGraphics(bool wait) {
         }
         const auto key = it.key();
         build->pipeline->PublishStages(build->live_infos);
-        RegisterPipelineData(key, std::hash<GraphicsPipelineKey>{}(key), build->data);
+        if (build->pipeline->Handle()) {
+            RegisterPipelineData(key, std::hash<GraphicsPipelineKey>{}(key), build->data);
+            ++num_new_pipelines;
+        }
         graphics_pipelines.emplace(key, std::move(build->pipeline));
-        ++num_new_pipelines;
         it = pending_graphics.erase(it);
     }
 }
@@ -1116,7 +1120,7 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
         }
     }
     const auto it = graphics_pipelines.find(prepared.key);
-    return it != graphics_pipelines.end() ? it->second.get() : nullptr;
+    return it != graphics_pipelines.end() && it->second->Handle() ? it->second.get() : nullptr;
 }
 
 
@@ -1356,7 +1360,10 @@ const GraphicsPipeline* PipelineCache::RememberFastGraphicsPipeline(
     const GraphicsPipeline* pipeline, const DrawIndirectParams params,
     const PreparedDraw* prepared) {
     fast_graphics.valid = false;
-    if (!FastGraphicsKeyEnabled() || prepared || params.is_indirect || !pipeline ||
+    if (!pipeline || !pipeline->Handle()) {
+        return nullptr;
+    }
+    if (!FastGraphicsKeyEnabled() || prepared || params.is_indirect ||
         EmulatorSettings.IsShaderCollect() || FrameCapture::Active()) {
         return pipeline;
     }
@@ -1515,14 +1522,16 @@ compile_now:
             instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
             sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
 
-        RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
-        ++num_new_pipelines;
+        if (it.value()->Handle()) {
+            RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
+            ++num_new_pipelines;
 
-        if (EmulatorSettings.IsShaderCollect()) {
-            for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                if (sel.infos[stage]) {
-                    auto& m = sel.modules[stage];
-                    module_related_pipelines[m].emplace_back(sel.graphics_key);
+            if (EmulatorSettings.IsShaderCollect()) {
+                for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+                    if (sel.infos[stage]) {
+                        auto& m = sel.modules[stage];
+                        module_related_pipelines[m].emplace_back(sel.graphics_key);
+                    }
                 }
             }
         }

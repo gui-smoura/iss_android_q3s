@@ -69,6 +69,25 @@ class EnvironmentTests(unittest.TestCase):
             self.assertNotIn("TLG_ENGINE_FPS", env)
             self.assertNotIn("TLG_READBACK_LINEAR", env)
 
+    def test_game_dir_config_ini_fallback_and_env_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as game_tmp:
+            cfg = Path(game_tmp) / "config.ini"
+            cfg.write_text(
+                "# comment\n"
+                "ISS_DIRECT_MEM_MB = 3584\n"
+                "ISS_BUFFER_CACHE_BUDGET_MB = 384\n"
+                "TLG_DROP_MIP0 = 1\n"
+                "resolution_scale = 0.5\n"
+            )
+            env = {"ISS_GAME_DIR": game_tmp}
+            launch.setup_environment(env, Path(tmp))
+            self.assertEqual(env["ISS_CONFIG"], str(cfg))
+            self.assertEqual(env["TLG_CONFIG"], str(cfg))
+            self.assertEqual(env["ISS_DIRECT_MEM_MB"], "3584")
+            self.assertEqual(env["ISS_BUFFER_CACHE_BUDGET_MB"], "384")
+            self.assertEqual(env["TLG_DROP_MIP0"], "1")
+            self.assertNotIn("resolution_scale", env)
+
 if __name__ == "__main__":
     unittest.main()
 

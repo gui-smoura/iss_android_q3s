@@ -37,7 +37,7 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 16u; // QGL: LDS atomics moved to a storage buffer
+static constexpr u32 ShaderBinaryVersion = 17u; // QGL: Workgroup CAS/non-atomic LDS + U32 struct access chain
 static constexpr u32 ShaderMetaVersion = 9u; // tlg: LDS barrier scope per guest wave
 static constexpr u32 PipelineKeyVersion = 5u; // tlg: Info layout (ImageResource::needs_native)
 } // namespace Serialization
@@ -97,7 +97,7 @@ std::vector<u8> Encode(const Key& global, const Key& pipeline, u64 graphics_hash
         }
         blob(binary.key);
         blob(binary.data);
-    }
+    };
     append(u64{XXH3_64bits(bytes.data(), bytes.size())});
     return bytes;
 }
@@ -295,6 +295,27 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
                                    fmt::format("{:#x}", std::hash<GraphicsPipelineKey>{}(key)));
              ++attempt) {
             result = device.createGraphicsPipelineUnique(used_cache, used_info);
+        }
+        if (!restored && result.result != vk::Result::eSuccess && used_info.stageCount > 0 &&
+            used_info.pStages != nullptr) {
+            std::vector<vk::PipelineShaderStageCreateInfo> fallback_stages(
+                used_info.pStages, used_info.pStages + used_info.stageCount);
+            bool stripped_stage_pnext = false;
+            for (auto& st : fallback_stages) {
+                if (st.pNext != nullptr) {
+                    st.pNext = nullptr;
+                    stripped_stage_pnext = true;
+                }
+            }
+            auto fallback_info = used_info;
+            fallback_info.pStages = fallback_stages.data();
+            if (stripped_stage_pnext) {
+                result = device.createGraphicsPipelineUnique( vk::PipelineCache{}, fallback_info);
+            }
+            if (result.result != vk::Result::eSuccess) {
+                fallback_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+                result = device.createGraphicsPipelineUnique(vk::PipelineCache{}, fallback_info);
+            }
         }
         const auto ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - started)

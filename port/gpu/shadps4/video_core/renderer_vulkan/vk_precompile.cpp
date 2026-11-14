@@ -726,10 +726,16 @@ Precompile::Result PipelineCache::Precompile(
                 ComputePipeline pipeline{instance, scheduler, desc_heap, profile, cache,
                                          job.compute_key, *s.infos[0], s.modules[0],
                                          job.compute_data, false, nullptr};
+                if (!pipeline.Handle()) {
+                    job.error = "compute pipeline rejected by driver";
+                }
             } else {
                 GraphicsPipeline pipeline{instance, scheduler, desc_heap, profile, s.graphics_key,
                                           cache, s.infos, s.runtime_infos, s.fetch_shader,
                                           s.modules, job.graphics_data, false};
+                if (!pipeline.Handle()) {
+                    job.error = "graphics pipeline rejected by driver";
+                }
             }
         } catch (const std::exception& e) {
             job.error = e.what();

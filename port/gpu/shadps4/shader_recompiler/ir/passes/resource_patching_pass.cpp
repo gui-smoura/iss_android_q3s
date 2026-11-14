@@ -360,16 +360,33 @@ static IR::Value IsMbcntWithExec(IR::Value value, bool is_hi, IR::U1 exec) {
     return inst->Arg(1);
 }
 
-static IR::Use FindUniqueUser(IR::Inst* inst, auto&& pred) {
+static IR::Use TryFindUniqueUser(IR::Inst* inst, auto&& pred) {
     IR::Use picked{};
     for (auto& use : inst->Uses()) {
         if (pred(use.user)) {
-            ASSERT(!picked.user);
+            if (picked.user) {
+                return {};
+            }
             picked = use;
         }
     }
-    ASSERT(picked.user);
     return picked;
+}
+
+static bool TryRemoveMbcntOperand(IR::Value vz, IR::U1 exec) {
+    if (vz.IsEmpty() || vz.IsImmediate()) {
+        return false;
+    }
+    auto vy = IsMbcntWithExec(vz, false, exec);
+    if (vy.IsEmpty() || vy.IsImmediate()) {
+        return false;
+    }
+    auto zero_const = IsMbcntWithExec(vy, true, exec);
+    if (zero_const.IsEmpty() || !zero_const.IsImmediate() || zero_const.U32() != 0u) {
+        return false;
+    }
+    vz.Inst()->ReplaceUsesWithAndRemove(IR::Value{u32{0u}});
+    return true;
 }
 
 static void RemoveAppendBufferLaneOffset(IR::Inst& vx) {
@@ -403,39 +420,41 @@ static void RemoveAppendBufferLaneOffset(IR::Inst& vx) {
         const auto& [user, operand] = use;
         if (user->GetOpcode() == IR::Opcode::MaskedBitCount32) {
             // First pattern
-            ASSERT(vx.GetOpcode() == IR::Opcode::DataAppend);
             IR::Inst* vy = user;
             auto vx_2 = IsMbcntWithExec(IR::Value{vy}, true, exec);
-            ASSERT(!vx_2.IsEmpty() && vx_2 == IR::Value{&vx});
-            const auto [idx, operand] = FindUniqueUser(vy, [](const IR::Inst* inst) {
+            if (vx_2.IsEmpty() || vx_2 != IR::Value{&vx}) {
+                continue;
+            }
+            const auto [idx, idx_op] = TryFindUniqueUser(vy, [](const IR::Inst* inst) {
                 return inst->GetOpcode() == IR::Opcode::MaskedBitCount32;
             });
+            if (!idx) {
+                continue;
+            }
             auto vy_2 = IsMbcntWithExec(IR::Value{idx}, false, exec);
-            ASSERT(!vy_2.IsEmpty() && vy_2 == IR::Value{vy});
-            idx->ReplaceUsesWithAndRemove(IR::Value{&vx});
+            if (!vy_2.IsEmpty() && vy_2 == IR::Value{vy}) {
+                idx->ReplaceUsesWithAndRemove(IR::Value{&vx});
+            }
             continue;
         }
         if (user->GetOpcode() != IR::Opcode::IAdd32 && user->GetOpcode() != IR::Opcode::ISub32) {
             continue;
         }
         const auto other = user->Arg(1 - operand);
-        if (other.IsImmediate()) {
-            ASSERT_MSG(other.U32() == 1u || other.U32() == std::numeric_limits<u32>::max() &&
-                                                vx.GetOpcode() == IR::Opcode::DataConsume,
-                       "Unexpected constant offset {} to DataConsume result", other.U32());
-            use = FindUniqueUser(user, [](const IR::Inst* inst) {
+        if (TryRemoveMbcntOperand(other, exec)) {
+            continue;
+        }
+        if (other.IsImmediate() &&
+            (other.U32() == 0u || other.U32() == 1u ||
+             other.U32() == std::numeric_limits<u32>::max())) {
+            const auto next_use = TryFindUniqueUser(user, [](const IR::Inst* inst) {
                 return inst->GetOpcode() == IR::Opcode::IAdd32 ||
                        inst->GetOpcode() == IR::Opcode::ISub32;
             });
+            if (next_use.user) {
+                TryRemoveMbcntOperand(next_use.user->Arg(1 - next_use.operand), exec);
+            }
         }
-
-        // Other patterns
-        auto vz = user->Arg(1 - operand);
-        auto vy = IsMbcntWithExec(vz, false, exec);
-        ASSERT(!vy.IsEmpty() && !vy.IsImmediate());
-        auto zero_const = IsMbcntWithExec(vy, true, exec);
-        ASSERT(!zero_const.IsEmpty() && zero_const.IsImmediate() && zero_const.U32() == 0u);
-        vz.Inst()->ReplaceUsesWithAndRemove(IR::Value{u32{0u}});
     }
 }
 

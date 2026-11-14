@@ -266,6 +266,11 @@ public:
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }
 
+    bool IsSubgroupSize64Supported(vk::ShaderStageFlagBits stage) const {
+        return IsSubgroupSize64Supported() &&
+               bool(vk13_props.requiredSubgroupSizeStages & stage);
+    }
+
     /// tlg: true if creating a pipeline can be told to fail instead of compiling it
     /// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
     bool IsPipelineCreationCacheControlSupported() const {

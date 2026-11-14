@@ -46,12 +46,12 @@ public final class BionicGameActivity extends Activity implements SurfaceHolder.
   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
   applyFullscreen();
   files=getFilesDir().getPath();base=files+"/issport";
-  screenMode=BionicVideoSettings.gameDisplayMode(getSharedPreferences("iss",0));
-  try{FramegenSettings.write(this);BionicPerformanceSettings.write(this);}catch(IOException e){record(e.toString());}
-  new File(base,"framegen.stats").delete();
   try(FileOutputStream out=new FileOutputStream(new File(files,"iss.log"),false)){
    out.write("inFAMOUS Second Son — Daedalus 0.2 · Android Bionic\n".getBytes(StandardCharsets.UTF_8));
   }catch(Exception ignored){}
+  screenMode=BionicVideoSettings.gameDisplayMode(getSharedPreferences("iss",0));
+  try{FramegenSettings.write(this);BionicPerformanceSettings.write(this);}catch(IOException e){record(e.toString());}
+  new File(base,"framegen.stats").delete();
   pad=new PadBridge(new File(base,"android-pad.state"));
   audio=new AudioBridge(new File(base,"audio.fifo"));
   frame=new FrameLayout(this);frame.setBackgroundColor(0xff000000);

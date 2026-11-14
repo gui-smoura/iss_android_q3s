@@ -61,7 +61,54 @@ def check_game_layout(game):
     print(f"ISS game layout OK: {game} (eboot, game modules, sce_sys and art/ accessible)", flush=True)
 
 
+def _resolve_config_file(env, user_dir):
+    primary = user_dir / "tlg.ini"
+    candidates = [primary, user_dir / "config.ini"]
+    for var in ("ISS_GAME_DIR", "TLG_GAME_DIR"):
+        game_dir = env.get(var)
+        if game_dir:
+            gpath = Path(game_dir)
+            candidates.append(gpath / "config.ini")
+            candidates.append(gpath / "tlg.ini")
+    chosen = primary
+    for cand in candidates:
+        try:
+            if cand.is_file() and cand.stat().st_size > 0:
+                chosen = cand
+                break
+        except OSError:
+            continue
+    return chosen, candidates
+
+
+def _apply_ini_env_overrides(env, candidates):
+    seen = set()
+    for cand in candidates:
+        key_path = str(cand)
+        if key_path in seen:
+            continue
+        seen.add(key_path)
+        try:
+            if not cand.is_file():
+                continue
+            for raw in cand.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line[0] in ("#", ";", "[") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if (k.startswith("ISS_") or k.startswith("TLG_")) and k and v:
+                    env.setdefault(k, v)
+                    if k.startswith("ISS_") and len(k) > 4:
+                        env.setdefault("TLG_" + k[4:], v)
+        except OSError:
+            continue
+
+
 def setup_environment(env, user_dir):
+    chosen_cfg, candidates = _resolve_config_file(env, user_dir)
+    _apply_ini_env_overrides(env, candidates)
     bionic = env.get("ISS_BIONIC") == "1"
     if bionic:
         # Device-tested in the glibc port: avoid Precise buffer page-read traps.
@@ -74,8 +121,13 @@ def setup_environment(env, user_dir):
             # texture eviction permanently above a 3.5 GiB process-wide threshold.
             continue
         env.setdefault(key, value)
-    # Save/config and shader caches are in the APK's private writable directory.
-    env.setdefault("ISS_CONFIG", str(user_dir / "tlg.ini"))
+    # Save/config and shader caches are in the APK's private writable directory,
+    # falling back to config.ini/tlg.ini in the game directory when user/tlg.ini is absent.
+    if env.get("ISS_CONFIG") == str(user_dir / "tlg.ini") and chosen_cfg != user_dir / "tlg.ini":
+        env["ISS_CONFIG"] = str(chosen_cfg)
+        if env.get("TLG_CONFIG") == str(user_dir / "tlg.ini"):
+            env["TLG_CONFIG"] = str(chosen_cfg)
+    env.setdefault("ISS_CONFIG", str(chosen_cfg))
     env.setdefault("TLG_CONFIG", env["ISS_CONFIG"])
     env.setdefault("TLG_GPU_USER_DIR", str(user_dir))
     env.setdefault("ISS_APP_NAME", "inFAMOUS Second Son")

@@ -418,7 +418,27 @@ int main(int argc, char** argv) {
         ser_cpp = (
             ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
         ).read_text()
-        self.assertIn("ShaderBinaryVersion = 16u;", ser_cpp)
+        self.assertIn("ShaderBinaryVersion = 17u;", ser_cpp)
+
+        get_set_cpp = (
+            ROOT / "port/gpu/shadps4/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp"
+        ).read_text()
+        for fn_name in ("EmitLoadBufferU64", "EmitStoreBufferU64"):
+            fn_body = get_set_cpp.split(f"{fn_name}(", 1)[1].split("\n}\n", 1)[0]
+            self.assertNotIn("ctx.u64_zero_value", fn_body)
+            self.assertIn("ctx.u32_zero_value", fn_body)
+
+        patch_cpp = (
+            ROOT / "port/gpu/shadps4/shader_recompiler/ir/passes/resource_patching_pass.cpp"
+        ).read_text()
+        self.assertIn("TryFindUniqueUser", patch_cpp)
+        self.assertIn("TryRemoveMbcntOperand", patch_cpp)
+
+        ahb_cpp = (
+            ROOT / "port/gpu/shadps4/video_core/renderer_vulkan/vk_swapchain_ahb.cpp"
+        ).read_text()
+        self.assertIn("set ISS_AHB_STAGING=0 to opt into native-ahb.\n        return true;", ahb_cpp)
+        self.assertIn("AHB swapchain: no buffer released by the app for 5 s; reclaiming buffer {}", ahb_cpp)
 
         mem_c = (ROOT / "port/src/runtime_memory.c").read_text()
         self.assertIn("ISS_DIRECT_MEM_MB", mem_c)
@@ -523,6 +543,53 @@ public:
                     capture_output=True, text=True
                 )
                 self.assertEqual(0, chk.returncode, chk.stderr)
+
+                # Compile and execute TlgSettings::Load() against ISS_GAME_DIR/config.ini fallback.
+                settings_main = p / "test_tlg_settings.cpp"
+                settings_bin = p / "test_tlg_settings"
+                settings_main.write_text(r"""
+#include "tlg_settings.h"
+#include <cassert>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+int main() {
+    auto& v = TlgSettings::Get();
+    TlgSettings::Load();
+    assert(std::fabs(v.lod_scale.load() - 0.5f) < 1e-4f);
+    assert(v.fps_limit.load() == 30);
+    const char* mem = std::getenv("ISS_DIRECT_MEM_MB");
+    assert(mem && std::strcmp(mem, "3584") == 0);
+    const char* budget = std::getenv("ISS_BUFFER_CACHE_BUDGET_MB");
+    assert(budget && std::strcmp(budget, "384") == 0);
+    return 0;
+}
+""")
+                game_dir = p / "game_dir"
+                game_dir.mkdir()
+                (game_dir / "config.ini").write_text(
+                    "lod_scale = 0.5\n"
+                    "fps_limit = 30\n"
+                    "ISS_DIRECT_MEM_MB = 3584\n"
+                    "ISS_BUFFER_CACHE_BUDGET_MB = 384\n"
+                )
+                subprocess.run(
+                    [
+                        "c++", "-std=c++20",
+                        "-I", str(ROOT / "port/gpu/shim"),
+                        "-I", str(ROOT / "port/include"),
+                        str(settings_main),
+                        str(ROOT / "port/gpu/shim/tlg_settings.cpp"),
+                        "-o", str(settings_bin),
+                    ],
+                    check=True, capture_output=True, text=True
+                )
+                import os
+                env = os.environ.copy()
+                for k in ("TLG_CONFIG", "ISS_CONFIG", "TLG_GPU_USER_DIR", "ISS_DIRECT_MEM_MB", "ISS_BUFFER_CACHE_BUDGET_MB"):
+                    env.pop(k, None)
+                env["ISS_GAME_DIR"] = str(game_dir)
+                subprocess.run([str(settings_bin)], cwd=str(p), env=env, check=True, capture_output=True, text=True)
 
 
 if __name__ == "__main__":

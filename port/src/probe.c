@@ -1344,11 +1344,59 @@ static void boot_step(const char *what) {
            (long)((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000));
 }
 
+static void load_ini_env_file(const char *path) {
+    if (!path || !*path) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p || *p == '#' || *p == ';' || *p == '[' || *p == '\r' || *p == '\n') continue;
+        char *eq = strchr(p, '=');
+        if (!eq || eq == p) continue;
+        char *ke = eq;
+        while (ke > p && (ke[-1] == ' ' || ke[-1] == '\t')) --ke;
+        *ke = 0;
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') ++val;
+        char *ve = val + strlen(val);
+        while (ve > val && (ve[-1] == '\r' || ve[-1] == '\n' || ve[-1] == ' ' || ve[-1] == '\t')) --ve;
+        *ve = 0;
+        if (!*val) continue;
+        if (strncmp(p, "ISS_", 4) == 0 || strncmp(p, "TLG_", 4) == 0) {
+            if (!getenv(p)) {
+#ifdef _WIN32
+                _putenv_s(p, val);
+#else
+                setenv(p, val, 0);
+#endif
+            }
+        }
+    }
+    fclose(f);
+}
+
+static void load_ini_env_overrides(void) {
+    load_ini_env_file(getenv("TLG_CONFIG"));
+    load_ini_env_file(getenv("ISS_CONFIG"));
+    const char *dirs[] = {getenv("TLG_GPU_USER_DIR"), getenv("ISS_GAME_DIR"), getenv("TLG_GAME_DIR")};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); ++i) {
+        if (!dirs[i] || !*dirs[i]) continue;
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/config.ini", dirs[i]);
+        load_ini_env_file(path);
+        snprintf(path, sizeof(path), "%s/tlg.ini", dirs[i]);
+        load_ini_env_file(path);
+    }
+}
+
 #ifndef TLG_BUILD_COMMIT
 #define TLG_BUILD_COMMIT "unknown"
 #endif
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    load_ini_env_overrides();
     alias_port_environment();
     apply_verbose_log();
     boot_step("start");

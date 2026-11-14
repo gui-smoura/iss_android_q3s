@@ -162,26 +162,36 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
             const IR::U32 handle = ir.Imm32(binding);
             const IR::U32 offset = ir.IMul(ir.GetAttributeU32(IR::Attribute::WorkgroupIndex),
                                            ir.Imm32(shared_memory_size));
-            const IR::U32 address = ir.IAdd(IR::U32{inst.Arg(0)}, offset);
+            const IR::U32 byte_address = ir.IAdd(IR::U32{inst.Arg(0)}, offset);
+            const auto elem_address = [&](u32 shift) -> IR::U32 {
+                return ir.ShiftRightLogical(byte_address, ir.Imm32(shift));
+            };
             switch (inst.GetOpcode()) {
             case IR::Opcode::SharedAtomicIAdd32:
-            case IR::Opcode::SharedAtomicIAdd64:
+            case IR::Opcode::SharedAtomicIAdd64: {
+                const u32 shift = inst.GetOpcode() == IR::Opcode::SharedAtomicIAdd64 ? 3u : 2u;
                 inst.ReplaceUsesWithAndRemove(
-                    ir.BufferAtomicIAdd(handle, address, inst.Arg(1), {}));
+                    ir.BufferAtomicIAdd(handle, elem_address(shift), inst.Arg(1), {}));
                 continue;
+            }
             case IR::Opcode::SharedAtomicISub32:
-            case IR::Opcode::SharedAtomicISub64:
+            case IR::Opcode::SharedAtomicISub64: {
+                const u32 shift = inst.GetOpcode() == IR::Opcode::SharedAtomicISub64 ? 3u : 2u;
                 inst.ReplaceUsesWithAndRemove(
-                    ir.BufferAtomicISub(handle, address, inst.Arg(1), {}));
+                    ir.BufferAtomicISub(handle, elem_address(shift), inst.Arg(1), {}));
                 continue;
+            }
             case IR::Opcode::SharedAtomicSMin32:
             case IR::Opcode::SharedAtomicUMin32:
             case IR::Opcode::SharedAtomicSMin64:
             case IR::Opcode::SharedAtomicUMin64: {
                 const bool is_signed = inst.GetOpcode() == IR::Opcode::SharedAtomicSMin32 ||
                                        inst.GetOpcode() == IR::Opcode::SharedAtomicSMin64;
+                const bool is_64 = inst.GetOpcode() == IR::Opcode::SharedAtomicSMin64 ||
+                                   inst.GetOpcode() == IR::Opcode::SharedAtomicUMin64;
                 inst.ReplaceUsesWithAndRemove(
-                    ir.BufferAtomicIMin(handle, address, inst.Arg(1), is_signed, {}));
+                    ir.BufferAtomicIMin(handle, elem_address(is_64 ? 3u : 2u), inst.Arg(1),
+                                        is_signed, {}));
                 continue;
             }
             case IR::Opcode::SharedAtomicSMax32:
@@ -190,52 +200,66 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
             case IR::Opcode::SharedAtomicUMax64: {
                 const bool is_signed = inst.GetOpcode() == IR::Opcode::SharedAtomicSMax32 ||
                                        inst.GetOpcode() == IR::Opcode::SharedAtomicSMax64;
+                const bool is_64 = inst.GetOpcode() == IR::Opcode::SharedAtomicSMax64 ||
+                                   inst.GetOpcode() == IR::Opcode::SharedAtomicUMax64;
                 inst.ReplaceUsesWithAndRemove(
-                    ir.BufferAtomicIMax(handle, address, inst.Arg(1), is_signed, {}));
+                    ir.BufferAtomicIMax(handle, elem_address(is_64 ? 3u : 2u), inst.Arg(1),
+                                        is_signed, {}));
                 continue;
             }
             case IR::Opcode::SharedAtomicInc32:
-                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicInc(handle, address, {}));
+                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicInc(handle, elem_address(2u), {}));
                 continue;
             case IR::Opcode::SharedAtomicDec32:
-                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicDec(handle, address, {}));
+                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicDec(handle, elem_address(2u), {}));
                 continue;
             case IR::Opcode::SharedAtomicAnd32:
-            case IR::Opcode::SharedAtomicAnd64:
-                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicAnd(handle, address, inst.Arg(1), {}));
-                continue;
-            case IR::Opcode::SharedAtomicOr32:
-            case IR::Opcode::SharedAtomicOr64:
-                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicOr(handle, address, inst.Arg(1), {}));
-                continue;
-            case IR::Opcode::SharedAtomicXor32:
-            case IR::Opcode::SharedAtomicXor64:
-                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicXor(handle, address, inst.Arg(1), {}));
-                continue;
-            case IR::Opcode::SharedAtomicCmpSwap32:
-            case IR::Opcode::SharedAtomicCmpSwap64:
+            case IR::Opcode::SharedAtomicAnd64: {
+                const u32 shift = inst.GetOpcode() == IR::Opcode::SharedAtomicAnd64 ? 3u : 2u;
                 inst.ReplaceUsesWithAndRemove(
-                    ir.BufferAtomicCmpSwap(handle, address, inst.Arg(1), inst.Arg(2), {}));
+                    ir.BufferAtomicAnd(handle, elem_address(shift), inst.Arg(1), {}));
                 continue;
+            }
+            case IR::Opcode::SharedAtomicOr32:
+            case IR::Opcode::SharedAtomicOr64: {
+                const u32 shift = inst.GetOpcode() == IR::Opcode::SharedAtomicOr64 ? 3u : 2u;
+                inst.ReplaceUsesWithAndRemove(
+                    ir.BufferAtomicOr(handle, elem_address(shift), inst.Arg(1), {}));
+                continue;
+            }
+            case IR::Opcode::SharedAtomicXor32:
+            case IR::Opcode::SharedAtomicXor64: {
+                const u32 shift = inst.GetOpcode() == IR::Opcode::SharedAtomicXor64 ? 3u : 2u;
+                inst.ReplaceUsesWithAndRemove(
+                    ir.BufferAtomicXor(handle, elem_address(shift), inst.Arg(1), {}));
+                continue;
+            }
+            case IR::Opcode::SharedAtomicCmpSwap32:
+            case IR::Opcode::SharedAtomicCmpSwap64: {
+                const u32 shift = inst.GetOpcode() == IR::Opcode::SharedAtomicCmpSwap64 ? 3u : 2u;
+                inst.ReplaceUsesWithAndRemove(
+                    ir.BufferAtomicCmpSwap(handle, elem_address(shift), inst.Arg(1), inst.Arg(2), {}));
+                continue;
+            }
             case IR::Opcode::LoadSharedU16:
-                inst.ReplaceUsesWithAndRemove(ir.LoadBufferU16(handle, address, {}));
+                inst.ReplaceUsesWithAndRemove(ir.LoadBufferU16(handle, elem_address(1u), {}));
                 break;
             case IR::Opcode::LoadSharedU32:
-                inst.ReplaceUsesWithAndRemove(ir.LoadBufferU32(1, handle, address, {}));
+                inst.ReplaceUsesWithAndRemove(ir.LoadBufferU32(1, handle, elem_address(2u), {}));
                 break;
             case IR::Opcode::LoadSharedU64:
-                inst.ReplaceUsesWithAndRemove(ir.LoadBufferU64(handle, address, {}));
+                inst.ReplaceUsesWithAndRemove(ir.LoadBufferU64(handle, elem_address(3u), {}));
                 break;
             case IR::Opcode::WriteSharedU16:
-                ir.StoreBufferU16(handle, address, IR::U16{inst.Arg(1)}, {});
+                ir.StoreBufferU16(handle, elem_address(1u), IR::U16{inst.Arg(1)}, {});
                 inst.Invalidate();
                 break;
             case IR::Opcode::WriteSharedU32:
-                ir.StoreBufferU32(1, handle, address, inst.Arg(1), {});
+                ir.StoreBufferU32(1, handle, elem_address(2u), inst.Arg(1), {});
                 inst.Invalidate();
                 break;
             case IR::Opcode::WriteSharedU64:
-                ir.StoreBufferU64(handle, address, IR::U64{inst.Arg(1)}, {});
+                ir.StoreBufferU64(handle, elem_address(3u), IR::U64{inst.Arg(1)}, {});
                 inst.Invalidate();
                 break;
             default:

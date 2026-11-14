@@ -248,15 +248,65 @@ static void StartProfileWriter() {
 // (paths are left out: logs are posted in public issues).
 static void LogPlayerConfig() {
     std::printf("Config: ---- player configuration ----\n");
+    std::vector<std::string> candidates;
+    auto add_candidate = [&](const std::string& p) {
+        if (!p.empty() && std::find(candidates.begin(), candidates.end(), p) == candidates.end()) {
+            candidates.push_back(p);
+        }
+    };
     const char* cfg = std::getenv("TLG_CONFIG");
-    std::ifstream ini(cfg && *cfg ? cfg : "tlg.ini");
-    std::string line;
+    add_candidate(cfg && *cfg ? cfg : "tlg.ini");
+    if (const char* iss_cfg = std::getenv("ISS_CONFIG"); iss_cfg && *iss_cfg) {
+        add_candidate(iss_cfg);
+    }
+    for (const char* env_name : {"TLG_GPU_USER_DIR", "ISS_GAME_DIR", "TLG_GAME_DIR"}) {
+        if (const char* dir = std::getenv(env_name); dir && *dir) {
+            std::string base{dir};
+            while (!base.empty() && (base.back() == '/' || base.back() == '\\')) {
+                base.pop_back();
+            }
+            add_candidate(base + "/config.ini");
+            add_candidate(base + "/tlg.ini");
+        }
+    }
+    add_candidate("config.ini");
+
     int n = 0;
-    while (ini && std::getline(ini, line) && n < 300) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-        if (line.empty() || line[0] == '#' || line.find('=') == std::string::npos) continue;
-        std::printf("Config ini: %s\n", line.c_str());
-        ++n;
+    const std::string primary = candidates.front();
+    bool loaded_primary = false;
+    for (const auto& path : candidates) {
+        const bool is_game_override =
+            path != primary &&
+            ((std::getenv("ISS_GAME_DIR") && path.rfind(std::getenv("ISS_GAME_DIR"), 0) == 0) ||
+             (std::getenv("TLG_GAME_DIR") && path.rfind(std::getenv("TLG_GAME_DIR"), 0) == 0));
+        if (loaded_primary && !is_game_override) {
+            continue;
+        }
+        std::ifstream ini(path);
+        if (!ini) {
+            continue;
+        }
+        std::string line;
+        int file_lines = 0;
+        while (std::getline(ini, line) && n < 300) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+                line.pop_back();
+            }
+            const auto first = line.find_first_not_of(" \t");
+            if (first != std::string::npos && first > 0) {
+                line.erase(0, first);
+            }
+            if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '[' ||
+                line.find('=') == std::string::npos) {
+                continue;
+            }
+            std::printf("Config ini: %s\n", line.c_str());
+            ++n;
+            ++file_lines;
+        }
+        if (file_lines > 0) {
+            loaded_primary = true;
+        }
     }
     if (n == 0) std::printf("Config ini: (empty or missing: every setting at its default)\n");
     std::vector<std::string> vars;
@@ -285,6 +335,11 @@ static void LogPlayerConfig() {
 // the player's settings (the backports chosen there change the shader cache version) and the
 // game's identity (some recompiler switches are on by default for this serial).
 extern "C" void tlggpu_init_headless(const TlgGpuConfig* config) {
+#ifdef _WIN32
+    if (config && config->user_dir && !std::getenv("TLG_GPU_USER_DIR")) _putenv_s("TLG_GPU_USER_DIR", config->user_dir);
+#else
+    if (config && config->user_dir) setenv("TLG_GPU_USER_DIR", config->user_dir, 0);
+#endif
     TlgSettings::Load();
     {
         const auto& settings = TlgSettings::Get();
@@ -296,11 +351,6 @@ extern "C" void tlggpu_init_headless(const TlgGpuConfig* config) {
         }
     }
     g_sdk_version = config->sdk_version;
-#ifdef _WIN32
-    if (config->user_dir && !std::getenv("TLG_GPU_USER_DIR")) _putenv_s("TLG_GPU_USER_DIR", config->user_dir);
-#else
-    if (config->user_dir) setenv("TLG_GPU_USER_DIR", config->user_dir, 0);
-#endif
     Core::Emulator::FillElfInfo(*config);
 }
 

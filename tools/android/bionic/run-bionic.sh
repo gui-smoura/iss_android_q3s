@@ -30,8 +30,17 @@ export ISS_FSR3_CAPTURE=0 ISS_FSR3_DIAGNOSTICS=0
 unset TLG_DUMP_TRIGGER TLG_DUMP_DIR TLG_DUMP_FRAMES TLG_PRESENT_DUMP_TRIGGER TLG_PRESENT_DUMP_COUNT
 export TLG_FSR1=0 TLG_RCAS=0
 export TLG_PAD_FILE="$base/android-pad.state"
-export TLG_CONFIG="$base/user/tlg.ini" ISS_CONFIG="$base/user/tlg.ini"
 export TLG_GPU_USER_DIR="$base/user"
+cfg_path="$base/user/tlg.ini"
+if [ ! -s "$cfg_path" ]; then
+ for candidate in "$base/user/config.ini" "$TLG_GAME_DIR/config.ini" "$TLG_GAME_DIR/tlg.ini"; do
+  if [ -s "$candidate" ]; then
+   cfg_path="$candidate"
+   break
+  fi
+ done
+fi
+export TLG_CONFIG="$cfg_path" ISS_CONFIG="$cfg_path"
 export TLG_AUDIO_FIFO="$base/audio.fifo"
 # Native AudioOut mixes all ports to AudioBridge's fixed s16/stereo/48 kHz FIFO.
 # SDL remains available for gamepads; no SDL audio device/JNI is used by Bionic.

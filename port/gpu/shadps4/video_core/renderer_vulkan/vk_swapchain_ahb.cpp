@@ -82,10 +82,20 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
                 return false;
             }
         }
-        // Mesa Turnip's Vulkan AHB import / UBWC layout can disagree with Horizon OS
-        // SurfaceFlinger on Quest 3/3S (producing vertical static stripes). Render to an
-        // internal device-local image and stage via linear CPU-locked AHB on non-Qualcomm drivers.
-        return instance.GetDriverID() != vk::DriverId::eQualcommProprietary;
+        if (const char* env = std::getenv("TLG_AHB_STAGING")) {
+            if (env[0] == '1') {
+                return true;
+            }
+            if (env[0] == '0') {
+                return false;
+            }
+        }
+        // Both Mesa Turnip and Qualcomm Adreno system driver on Quest 3S/HorizonOS
+        // have issues with direct Vulkan AHB import (vertical UBWC stripes on Turnip,
+        // black presentation and sync_fd release stalls on Qualcomm). Render to an
+        // internal device-local image and stage via linear CPU-locked AHB by default;
+        // set ISS_AHB_STAGING=0 to opt into native-ahb.
+        return true;
     }();
     if (!use_staging) {
         const vk::PhysicalDeviceExternalSemaphoreInfo semaphore_info{
@@ -577,7 +587,11 @@ bool Swapchain::AcquireNextImage() {
             HandleRelease(release);
         } else if (!warned && std::chrono::steady_clock::now() - wait_start > std::chrono::seconds(5)) {
             warned = true;
-            LOG_WARNING(Render_Vulkan, "AHB swapchain: no buffer released by the app for 5 s");
+            const u32 reclaimed = static_cast<u32>((image_index + 1) % buffers.size());
+            LOG_WARNING(Render_Vulkan,
+                        "AHB swapchain: no buffer released by the app for 5 s; reclaiming buffer {}",
+                        reclaimed);
+            free_queue.push_back(reclaimed);
         }
     }
     image_index = free_queue.front();

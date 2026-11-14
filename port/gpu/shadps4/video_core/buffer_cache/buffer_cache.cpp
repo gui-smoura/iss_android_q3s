@@ -80,7 +80,7 @@ u64 BufferCache::ResidencyGranuleSize() {
 u64 BufferCache::ResidencyBudgetBytes() {
     static const u64 bytes = []() -> u64 {
 #if defined(__ANDROID__) && defined(ISS_ANDROID_BIONIC)
-        u64 mb = 1024;
+        u64 mb = 640;
 #else
         u64 mb = 0;
 #endif
@@ -881,6 +881,29 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         }
         TlgStats::Timer timer{TlgStats::t_resident};
 
+        const u64 needed_bytes = u64{resident_blocks} << block_shift;
+        const u64 budget = ResidencyBudgetBytes();
+        if (attempt == 0 && budget > 0 && !evicting_residency &&
+            residency_total_bytes + needed_bytes > budget) {
+            const u64 target = (budget * 3) / 4;
+            u64 freed = EvictUnusedResidency(target, 4);
+            if (residency_total_bytes + needed_bytes > budget + (64ull << 20)) {
+                freed += EvictUnusedResidency((budget * 7) / 8, 1);
+            }
+            if (freed > 0) {
+                TouchResidencyRange(bind_first, bind_end);
+                resident_blocks = 0;
+                bind_ranges.Clear();
+                resident_ranges.ForEachGap(bind_first, bind_end, [&](u64 start, u64 end) {
+                    resident_blocks += end - start;
+                    bind_ranges.Add({start, end});
+                });
+                if (bind_ranges.Empty()) {
+                    return;
+                }
+            }
+        }
+
         // All memory is allocated before anything is recorded or bound: making room for it
         // submits, which sends the pending binds and runs pending operations (and so can make
         // some of these ranges resident: the gaps are looked up again after it).
@@ -1241,13 +1264,20 @@ void BufferCache::RunGarbageCollector() {
         ++residency_gc_tick;
     };
     const u64 budget = ResidencyBudgetBytes();
-    if (budget == 0 || (residency_gc_tick % 64) != 0 || residency_total_bytes <= budget) {
+    if (budget == 0 || residency_total_bytes <= budget) {
         return;
     }
-    constexpr u64 MinAgeTicks = 30;
-    const u64 target = (budget * 7) / 8;
+    const bool urgent = residency_total_bytes > budget + (32ull << 20);
+    if (!urgent && (residency_gc_tick % 16) != 0) {
+        return;
+    }
+    constexpr u64 MinAgeTicks = 16;
+    const u64 target = (budget * 3) / 4;
     const u64 before = residency_total_bytes;
-    const u64 freed = EvictUnusedResidency(target, MinAgeTicks);
+    u64 freed = EvictUnusedResidency(target, MinAgeTicks);
+    if (residency_total_bytes > budget) {
+        freed += EvictUnusedResidency((budget * 7) / 8, 4);
+    }
     if (freed > 0) {
         const auto now = std::chrono::steady_clock::now();
         if (residency_gc_report_time.time_since_epoch().count() == 0 ||
