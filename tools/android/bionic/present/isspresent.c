@@ -52,6 +52,10 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <android/surface_control.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <jni.h>
@@ -233,10 +237,16 @@ static void apply_frame_rate(void) {
     LOGI("display: child surface requests %.1f Hz",S.frame_rate);
 }
 
+static int egl_is_forced(void);
+
 static void make_surface_control(void) {
-    if (!api.ok || !S.window || S.sc) return;
+    if (!S.window || S.sc || egl_is_forced()) return;
+    if (!api.ok) {
+        LOGI("ASurfaceControl unavailable; using zero-copy EGL AHardwareBuffer presenter");
+        return;
+    }
     S.sc = api.create_from_window(S.window, "isspresent");
-    if (!S.sc) LOGE("ASurfaceControl_createFromWindow failed");
+    if (!S.sc) LOGI("ASurfaceControl_createFromWindow returned NULL; falling back to EGL AHardwareBuffer presenter");
     else { LOGI("surface control created"); apply_frame_rate(); }
 }
 
@@ -460,10 +470,457 @@ static void present_frame(const iss_present_msg* m, int acquire_fd) {
     pump_queue();
 }
 
+typedef struct {
+    EGLImageKHR image;
+    uint64_t seq;
+} EglSlotImage;
+
+static struct {
+    EGLDisplay dpy;
+    EGLConfig cfg;
+    EGLContext ctx;
+    EGLSurface surf;
+    int has_surface;
+    int initialized;
+    int failed;
+    int force_egl;
+    int shutdown;
+    int surf_w, surf_h;
+    GLuint prog;
+    GLuint tex;
+    GLint a_pos;
+    GLint a_uv;
+    GLint u_tex;
+    EglSlotImage imgs[ISS_PRESENT_MAX_BUFFERS];
+    uint64_t buf_seq[ISS_PRESENT_MAX_BUFFERS];
+    uint64_t buf_gen;
+    uint64_t win_seq;
+    uint64_t applied_seq;
+    int thread_alive;
+    pthread_cond_t win_cond;
+    PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC get_native_buf;
+    PFNEGLCREATEIMAGEKHRPROC create_image;
+    PFNEGLDESTROYIMAGEKHRPROC destroy_image;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_tex_2d;
+    PFNEGLCREATESYNCKHRPROC create_sync;
+    PFNEGLDESTROYSYNCKHRPROC destroy_sync;
+    PFNEGLWAITSYNCKHRPROC wait_sync;
+    PFNEGLDUPNATIVEFENCEFDANDROIDPROC dup_fence_fd;
+    int has_native_fence;
+    int has_wait_sync;
+} E = {
+    .dpy = EGL_NO_DISPLAY,
+    .ctx = EGL_NO_CONTEXT,
+    .surf = EGL_NO_SURFACE,
+    .a_pos = -1,
+    .a_uv = -1,
+    .u_tex = -1,
+    .win_cond = PTHREAD_COND_INITIALIZER,
+};
+
+static int egl_is_forced(void) {
+    return E.force_egl;
+}
+
+static GLuint egl_compile_shader(GLenum type, const char* src) {
+    GLuint sh = glCreateShader(type);
+    if (!sh) return 0;
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char logbuf[512];
+        glGetShaderInfoLog(sh, (GLsizei)sizeof(logbuf), NULL, logbuf);
+        LOGE("GLES2 shader compile failed (%u): %s", (unsigned)type, logbuf);
+        glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+static int egl_init_gl(void) {
+    if (E.prog && E.tex) return 1;
+    static const char* vs_src =
+        "attribute vec2 aPos;\n"
+        "attribute vec2 aUv;\n"
+        "varying vec2 vUv;\n"
+        "void main() {\n"
+        "  gl_Position = vec4(aPos, 0.0, 1.0);\n"
+        "  vUv = aUv;\n"
+        "}\n";
+    static const char* fs_src =
+        "#extension GL_OES_EGL_image_external : require\n"
+        "precision mediump float;\n"
+        "varying vec2 vUv;\n"
+        "uniform samplerExternalOES uTex;\n"
+        "void main() {\n"
+        "  gl_FragColor = texture2D(uTex, vUv);\n"
+        "}\n";
+    GLuint vs = egl_compile_shader(GL_VERTEX_SHADER, vs_src);
+    GLuint fs = egl_compile_shader(GL_FRAGMENT_SHADER, fs_src);
+    if (!vs || !fs) {
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        return 0;
+    }
+    GLuint prog = glCreateProgram();
+    if (!prog) {
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return 0;
+    }
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint linked = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char logbuf[512];
+        glGetProgramInfoLog(prog, (GLsizei)sizeof(logbuf), NULL, logbuf);
+        LOGE("GLES2 program link failed: %s", logbuf);
+        glDeleteProgram(prog);
+        return 0;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    if (!tex) {
+        glDeleteProgram(prog);
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+    E.prog = prog;
+    E.tex = tex;
+    E.a_pos = glGetAttribLocation(prog, "aPos");
+    E.a_uv = glGetAttribLocation(prog, "aUv");
+    E.u_tex = glGetUniformLocation(prog, "uTex");
+    return E.a_pos >= 0 && E.a_uv >= 0 && E.u_tex >= 0;
+}
+
+static int egl_ensure_display(void) {
+    if (E.initialized) return 1;
+    if (E.failed) return 0;
+
+    E.dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (E.dpy == EGL_NO_DISPLAY || !eglInitialize(E.dpy, NULL, NULL)) {
+        LOGE("EGL initialization failed (0x%x)", eglGetError());
+        E.failed = 1;
+        return 0;
+    }
+
+    static const EGLint cfg_attrs[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLint num_cfg = 0;
+    if (!eglChooseConfig(E.dpy, cfg_attrs, &E.cfg, 1, &num_cfg) || num_cfg < 1) {
+        LOGE("eglChooseConfig failed (0x%x)", eglGetError());
+        E.failed = 1;
+        return 0;
+    }
+
+    static const EGLint ctx_attrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+    E.ctx = eglCreateContext(E.dpy, E.cfg, EGL_NO_CONTEXT, ctx_attrs);
+    if (E.ctx == EGL_NO_CONTEXT) {
+        LOGE("eglCreateContext failed (0x%x)", eglGetError());
+        E.failed = 1;
+        return 0;
+    }
+
+    *(void**)&E.get_native_buf = (void*)eglGetProcAddress("eglGetNativeClientBufferANDROID");
+    *(void**)&E.create_image = (void*)eglGetProcAddress("eglCreateImageKHR");
+    *(void**)&E.destroy_image = (void*)eglGetProcAddress("eglDestroyImageKHR");
+    *(void**)&E.image_target_tex_2d = (void*)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    *(void**)&E.create_sync = (void*)eglGetProcAddress("eglCreateSyncKHR");
+    *(void**)&E.destroy_sync = (void*)eglGetProcAddress("eglDestroySyncKHR");
+    *(void**)&E.wait_sync = (void*)eglGetProcAddress("eglWaitSyncKHR");
+    *(void**)&E.dup_fence_fd = (void*)eglGetProcAddress("eglDupNativeFenceFDANDROID");
+
+    if (!E.get_native_buf || !E.create_image || !E.destroy_image || !E.image_target_tex_2d) {
+        LOGE("Missing required EGL/GLES2 AHardwareBuffer extensions");
+        E.failed = 1;
+        return 0;
+    }
+
+    const char* exts = eglQueryString(E.dpy, EGL_EXTENSIONS);
+    E.has_native_fence = exts && strstr(exts, "EGL_ANDROID_native_fence_sync") &&
+        E.create_sync && E.destroy_sync && E.dup_fence_fd;
+    E.has_wait_sync = E.has_native_fence && strstr(exts, "EGL_KHR_wait_sync") && E.wait_sync;
+
+    E.initialized = 1;
+    LOGI("EGL AHB presenter initialized (native_fence=%d wait_sync=%d)", E.has_native_fence, E.has_wait_sync);
+    return 1;
+}
+
+static void egl_clear_images(void) {
+    if (E.dpy != EGL_NO_DISPLAY && E.destroy_image) {
+        for (uint32_t i = 0; i < ISS_PRESENT_MAX_BUFFERS; ++i) {
+            if (E.imgs[i].image != EGL_NO_IMAGE_KHR) {
+                E.destroy_image(E.dpy, E.imgs[i].image);
+                E.imgs[i].image = EGL_NO_IMAGE_KHR;
+            }
+            E.imgs[i].seq = 0;
+        }
+    }
+}
+
+static void egl_detach_surface_locked(void) {
+    if (E.dpy != EGL_NO_DISPLAY) {
+        if (eglGetCurrentContext() == E.ctx && E.tex) {
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+        }
+        egl_clear_images();
+        eglMakeCurrent(E.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (E.surf != EGL_NO_SURFACE) {
+            eglDestroySurface(E.dpy, E.surf);
+            E.surf = EGL_NO_SURFACE;
+        }
+    }
+    E.has_surface = 0;
+    E.surf_w = 0;
+    E.surf_h = 0;
+}
+
+static void egl_sync_window_locked(void) {
+    egl_detach_surface_locked();
+    if (S.window && !S.sc && !E.shutdown) {
+        if (egl_ensure_display()) {
+            static const EGLint surf_attrs[] = { EGL_NONE };
+            E.surf = eglCreateWindowSurface(E.dpy, E.cfg, S.window, surf_attrs);
+            if (E.surf == EGL_NO_SURFACE) {
+                LOGE("eglCreateWindowSurface failed (0x%x)", eglGetError());
+            } else if (!eglMakeCurrent(E.dpy, E.surf, E.surf, E.ctx)) {
+                LOGE("eglMakeCurrent failed (0x%x)", eglGetError());
+                eglDestroySurface(E.dpy, E.surf);
+                E.surf = EGL_NO_SURFACE;
+            } else {
+                eglSwapInterval(E.dpy, 0);
+                if (!egl_init_gl()) {
+                    LOGE("GLES2 init failed");
+                    egl_detach_surface_locked();
+                    E.failed = 1;
+                } else {
+                    eglQuerySurface(E.dpy, E.surf, EGL_WIDTH, &E.surf_w);
+                    eglQuerySurface(E.dpy, E.surf, EGL_HEIGHT, &E.surf_h);
+                    E.has_surface = 1;
+                    LOGI("EGL AHB presenter surface attached (%dx%d)", E.surf_w, E.surf_h);
+                }
+            }
+        }
+    }
+    E.applied_seq = E.win_seq;
+    pthread_cond_broadcast(&E.win_cond);
+}
+
+static void egl_shutdown_locked(void) {
+    if (E.dpy != EGL_NO_DISPLAY) {
+        if (E.surf != EGL_NO_SURFACE && eglMakeCurrent(E.dpy, E.surf, E.surf, E.ctx)) {
+            if (E.tex) { glDeleteTextures(1, &E.tex); E.tex = 0; }
+            if (E.prog) { glDeleteProgram(E.prog); E.prog = 0; }
+        }
+        egl_detach_surface_locked();
+        if (E.ctx != EGL_NO_CONTEXT) {
+            eglDestroyContext(E.dpy, E.ctx);
+            E.ctx = EGL_NO_CONTEXT;
+        }
+        eglTerminate(E.dpy);
+        E.dpy = EGL_NO_DISPLAY;
+    }
+    E.tex = 0;
+    E.prog = 0;
+    E.a_pos = -1;
+    E.a_uv = -1;
+    E.u_tex = -1;
+    E.initialized = 0;
+    E.failed = 0;
+    E.has_surface = 0;
+    E.surf_w = 0;
+    E.surf_h = 0;
+}
+
+static EGLImageKHR egl_get_image(uint32_t index) {
+    uint64_t seq = E.buf_seq[index];
+    if (seq && E.imgs[index].image != EGL_NO_IMAGE_KHR && E.imgs[index].seq == seq) {
+        return E.imgs[index].image;
+    }
+    if (E.imgs[index].image != EGL_NO_IMAGE_KHR) {
+        E.destroy_image(E.dpy, E.imgs[index].image);
+        E.imgs[index].image = EGL_NO_IMAGE_KHR;
+        E.imgs[index].seq = 0;
+    }
+    EGLClientBuffer cbuf = E.get_native_buf(S.bufs[index]);
+    if (!cbuf) {
+        LOGE("eglGetNativeClientBufferANDROID failed for slot %u", index);
+        return EGL_NO_IMAGE_KHR;
+    }
+    static const EGLint attrs[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
+    EGLImageKHR img = E.create_image(E.dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, cbuf, attrs);
+    if (img == EGL_NO_IMAGE_KHR) {
+        LOGE("eglCreateImageKHR failed for slot %u (0x%x)", index, eglGetError());
+        return EGL_NO_IMAGE_KHR;
+    }
+    E.imgs[index].image = img;
+    E.imgs[index].seq = seq;
+    return img;
+}
+
+static void egl_present_frame(const iss_present_msg* m, int acquire_fd) {
+    const int trace_index = iss_present_trace_index(m);
+    if (m->generation != S.generation || m->index >= S.count || !S.bufs[m->index]) {
+        if (trace_index >= 0) trace_event(trace_index, "event=drop frame=%llu reason=invalid_buffer time_ns=%lld",
+                    (unsigned long long)m->frame, (long long)trace_clock_ns());
+        if (acquire_fd >= 0) close(acquire_fd);
+        return;
+    }
+    S.trace_indices[m->index] = trace_index;
+    S.trace_frames[m->index] = m->frame;
+    if (trace_index >= 0) trace_event(trace_index, "event=receive frame=%llu generation=%u buffer=%u received_ns=%lld",
+                (unsigned long long)m->frame, m->generation, m->index, (long long)trace_clock_ns());
+    atomic_fetch_add(&S.frames, 1);
+
+    if (E.applied_seq != E.win_seq) {
+        egl_sync_window_locked();
+    }
+    if (!S.window || !E.has_surface || E.surf == EGL_NO_SURFACE || E.failed) {
+        if (trace_index >= 0) trace_event(trace_index, "event=drop frame=%llu reason=no_surface time_ns=%lld",
+                    (unsigned long long)m->frame, (long long)trace_clock_ns());
+        send_release(m->generation, m->index, m->frame, acquire_fd);
+        return;
+    }
+
+    if (eglGetCurrentContext() != E.ctx || eglGetCurrentSurface(EGL_DRAW) != E.surf) {
+        if (!eglMakeCurrent(E.dpy, E.surf, E.surf, E.ctx)) {
+            LOGE("eglMakeCurrent failed during draw (0x%x)", eglGetError());
+            send_release(m->generation, m->index, m->frame, acquire_fd);
+            return;
+        }
+    }
+
+    if (acquire_fd >= 0) {
+        if (E.has_wait_sync) {
+            EGLint sync_attrs[] = { EGL_SYNC_NATIVE_FENCE_FD_ANDROID, acquire_fd, EGL_NONE };
+            EGLSyncKHR acq_sync = E.create_sync(E.dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, sync_attrs);
+            if (acq_sync != EGL_NO_SYNC_KHR) {
+                acquire_fd = -1; /* EGL took ownership of acquire_fd */
+                E.wait_sync(E.dpy, acq_sync, 0);
+                E.destroy_sync(E.dpy, acq_sync);
+            } else {
+                struct pollfd pfd = { acquire_fd, POLLIN, 0 };
+                poll(&pfd, 1, 1000);
+                close(acquire_fd);
+                acquire_fd = -1;
+            }
+        } else {
+            struct pollfd pfd = { acquire_fd, POLLIN, 0 };
+            poll(&pfd, 1, 1000);
+            close(acquire_fd);
+            acquire_fd = -1;
+        }
+    }
+
+    EGLImageKHR img = egl_get_image(m->index);
+    if (img == EGL_NO_IMAGE_KHR) {
+        send_release(m->generation, m->index, m->frame, -1);
+        return;
+    }
+
+    int w = E.surf_w, h = E.surf_h;
+    if (w <= 0 || h <= 0) {
+        eglQuerySurface(E.dpy, E.surf, EGL_WIDTH, &w);
+        eglQuerySurface(E.dpy, E.surf, EGL_HEIGHT, &h);
+        if (w <= 0 || h <= 0) {
+            w = ANativeWindow_getWidth(S.window);
+            h = ANativeWindow_getHeight(S.window);
+        }
+        if (w <= 0 || h <= 0) { w = (int)m->width; h = (int)m->height; }
+        E.surf_w = w;
+        E.surf_h = h;
+    }
+    int dw = w, dh = h;
+    gow3_display_size(w, h, m->width, m->height, S.fullscreen, &dw, &dh);
+    if (dw < w || dh < h) {
+        glViewport(0, 0, w, h);
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    int vx = (w - dw) / 2;
+    int vy = (h - dh) / 2;
+    glViewport(vx, vy, dw, dh);
+
+    if (trace_index >= 0) trace_event(trace_index, "event=apply frame=%llu txn=%llu generation=%u buffer=%u applied_ns=%lld source=0,0,%u,%u destination=%d,%d,%d,%d window=%d,%d fifo=0 acquire_fence=egl",
+                (unsigned long long)m->frame, (unsigned long long)(++S.txn_seq), m->generation, m->index,
+                (long long)trace_clock_ns(), m->width, m->height, vx, vy, vx + dw, vy + dh, w, h);
+
+    static const GLfloat kQuad[16] = {
+        -1.f,  1.f, 0.f, 0.f,
+         1.f,  1.f, 1.f, 0.f,
+        -1.f, -1.f, 0.f, 1.f,
+         1.f, -1.f, 1.f, 1.f,
+    };
+    glUseProgram(E.prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, E.tex);
+    E.image_target_tex_2d(GL_TEXTURE_EXTERNAL_OES, (GLeglImageOES)img);
+    glUniform1i(E.u_tex, 0);
+    glVertexAttribPointer((GLuint)E.a_pos, 2, GL_FLOAT, GL_FALSE, 4 * (GLsizei)sizeof(GLfloat), kQuad);
+    glVertexAttribPointer((GLuint)E.a_uv, 2, GL_FLOAT, GL_FALSE, 4 * (GLsizei)sizeof(GLfloat), kQuad + 2);
+    glEnableVertexAttribArray((GLuint)E.a_pos);
+    glEnableVertexAttribArray((GLuint)E.a_uv);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    int release_fd = -1;
+    if (E.has_native_fence) {
+        EGLSyncKHR rel_sync = E.create_sync(E.dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+        glFlush();
+        if (rel_sync != EGL_NO_SYNC_KHR) {
+            release_fd = E.dup_fence_fd(E.dpy, rel_sync);
+            E.destroy_sync(E.dpy, rel_sync);
+            if (release_fd == EGL_NO_NATIVE_FENCE_FD_ANDROID) release_fd = -1;
+        }
+    } else {
+        glFinish();
+    }
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+    if (!eglSwapBuffers(E.dpy, E.surf)) {
+        EGLint err = eglGetError();
+        LOGE("eglSwapBuffers failed (0x%x)", err);
+        if (err == EGL_CONTEXT_LOST) {
+            egl_shutdown_locked();
+        } else if (err == EGL_BAD_SURFACE || err == EGL_BAD_NATIVE_WINDOW) {
+            egl_detach_surface_locked();
+        }
+    }
+
+    if (trace_index >= 0) trace_event(trace_index, "event=complete frame=%llu txn=%llu latch_ns=-1 completed_ns=%lld previous_buffer=%u release_fence=%d",
+                (unsigned long long)m->frame, (unsigned long long)S.txn_seq,
+                (long long)trace_clock_ns(), m->index, release_fd >= 0);
+
+    send_release(m->generation, m->index, m->frame, release_fd);
+}
+
 static void close_connection(void) {
     if (S.conn_fd >= 0) { close(S.conn_fd); S.conn_fd = -1; }
     S.session++;
     S.last_set = -1;
+    egl_clear_images();
+    E.buf_gen++;
     drop_buffers(); /* also the FIFO queue (no connection to release to) and the outstanding id */
     S.count = 0;
     S.fifo = 0;
@@ -479,10 +936,11 @@ static void serve(int fd) {
     S.count = 0;
     S.fifo = 0;
     S.inflight = 0;
+    if (E.applied_seq != E.win_seq) egl_sync_window_locked();
     pthread_mutex_unlock(&S.lock);
     LOGI("game connected");
     for (;;) {
-        /* Block until the game sends something, or on_complete asks for the next queued frame. */
+        /* Block until the game sends something, or on_complete/window sync asks us to wake up. */
         struct pollfd pfds[2] = {{fd, POLLIN, 0}, {S.wake_fd, POLLIN, 0}};
         if (poll(pfds, 2, -1) < 0) {
             if (errno == EINTR) continue;
@@ -493,8 +951,11 @@ static void serve(int fd) {
             uint64_t n;
             if (read(S.wake_fd, &n, sizeof n) < 0 && errno != EAGAIN) LOGE("wake read failed: %s", strerror(errno));
             pthread_mutex_lock(&S.lock);
+            if (E.applied_seq != E.win_seq) egl_sync_window_locked();
+            int closing = E.shutdown;
             pump_queue();
             pthread_mutex_unlock(&S.lock);
+            if (closing) break;
         }
         if (!(pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
         iss_present_msg m;
@@ -505,8 +966,8 @@ static void serve(int fd) {
             break;
         }
         pthread_mutex_lock(&S.lock);
-        int stop = 0;
-        switch (m.type) {
+        int stop = E.shutdown;
+        if (!stop) switch (m.type) {
         case ISS_PRESENT_HELLO: {
             if (m.version != ISS_PRESENT_VERSION || m.count == 0 || m.count > ISS_PRESENT_MAX_BUFFERS) {
                 LOGE("bad HELLO: version %u (ours %u) count %u: the game and the app are not the same build",
@@ -514,6 +975,8 @@ static void serve(int fd) {
                 stop = 1;
                 break;
             }
+            egl_clear_images();
+            E.buf_gen++;
             drop_buffers(); /* clears the FIFO queue too */
             S.generation = m.generation;
             S.count = m.count;
@@ -527,6 +990,8 @@ static void serve(int fd) {
             break;
         }
         case ISS_PRESENT_RESET:
+            egl_clear_images();
+            E.buf_gen++;
             drop_buffers(); /* clears the FIFO queue too: its frames belong to the old set */
             S.generation = m.generation;
             S.count = m.count <= ISS_PRESENT_MAX_BUFFERS ? m.count : 0;
@@ -541,6 +1006,7 @@ static void serve(int fd) {
             if (m.generation == S.generation && m.index < S.count) {
                 if (S.bufs[m.index]) AHardwareBuffer_release(S.bufs[m.index]);
                 S.bufs[m.index] = b;
+                E.buf_seq[m.index] = ++E.buf_gen;
             } else {
                 AHardwareBuffer_release(b);
             }
@@ -550,7 +1016,11 @@ static void serve(int fd) {
             set_fifo((m.flags & ISS_PRESENT_FLAG_FIFO) != 0);
             break;
         case ISS_PRESENT_FRAME:
-            present_frame(&m, fence);
+            if (!S.sc && S.window) {
+                egl_present_frame(&m, fence);
+            } else {
+                present_frame(&m, fence);
+            }
             fence = -1;
             break;
         case ISS_PRESENT_BYE:
@@ -572,13 +1042,52 @@ static void serve(int fd) {
 static void* server_thread(void* unused) {
     (void)unused;
     for (;;) {
-        int fd = accept4(S.server_fd, NULL, NULL, SOCK_CLOEXEC);
-        if (fd < 0) {
+        int sfd, wfd;
+        pthread_mutex_lock(&S.lock);
+        if (E.applied_seq != E.win_seq) egl_sync_window_locked();
+        if (E.shutdown || S.server_fd < 0) {
+            egl_shutdown_locked();
+            E.shutdown = 0;
+            E.thread_alive = 0;
+            pthread_cond_broadcast(&E.win_cond);
+            pthread_mutex_unlock(&S.lock);
+            return NULL;
+        }
+        sfd = S.server_fd;
+        wfd = S.wake_fd;
+        pthread_mutex_unlock(&S.lock);
+
+        struct pollfd pfds[2] = {{sfd, POLLIN, 0}, {wfd, POLLIN, 0}};
+        int pr = poll(pfds, 2, -1);
+        if (pr < 0) {
             if (errno == EINTR) continue;
-            return NULL; /* closed by shutdown */
+            break;
+        }
+        if (pfds[1].revents & POLLIN) {
+            uint64_t n;
+            if (read(wfd, &n, sizeof n) < 0 && errno != EAGAIN) LOGE("wake read failed: %s", strerror(errno));
+            continue;
+        }
+        if (!(pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+
+        int fd = accept4(sfd, NULL, NULL, SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            pthread_mutex_lock(&S.lock);
+            int closing = E.shutdown || S.server_fd < 0;
+            pthread_mutex_unlock(&S.lock);
+            if (closing) break;
+            break;
         }
         serve(fd);
     }
+    pthread_mutex_lock(&S.lock);
+    egl_shutdown_locked();
+    E.shutdown = 0;
+    E.thread_alive = 0;
+    pthread_cond_broadcast(&E.win_cond);
+    pthread_mutex_unlock(&S.lock);
+    return NULL;
 }
 
 /* ---- JNI ---- */
@@ -591,6 +1100,13 @@ JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_IssPresent_nativeSetFullscreen(
     pthread_mutex_unlock(&S.lock);
 }
 
+JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_IssPresent_nativeSetForceEgl(
+        JNIEnv* env, jclass cls, jboolean enabled) {
+    (void)env; (void)cls;
+    pthread_mutex_lock(&S.lock);
+    E.force_egl = enabled != 0;
+    pthread_mutex_unlock(&S.lock);
+}
 
 JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_IssPresent_nativeSetFrameRate(JNIEnv* env,jclass cls,jfloat rate) {
     (void)env;(void)cls;
@@ -618,7 +1134,7 @@ JNIEXPORT jstring JNICALL Java_ro_cobrabm_fexdroid_IssPresent_nativeStart(JNIEnv
             snprintf(msg, sizeof msg, "socket path too long");
             goto fail;
         }
-        int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         struct sockaddr_un a;
         memset(&a, 0, sizeof a);
         a.sun_family = AF_UNIX;
@@ -633,8 +1149,19 @@ JNIEXPORT jstring JNICALL Java_ro_cobrabm_fexdroid_IssPresent_nativeStart(JNIEnv
         strcpy(S.path, path);
         S.server_fd = fd;
         S.started = 1;
-        pthread_create(&S.thread, NULL, server_thread, NULL);
-        LOGI("listening on %s, ASurfaceControl %s", path, api.ok ? "available" : "NOT available (Android 10+)");
+        E.shutdown = 0;
+        E.thread_alive = 1;
+        if (pthread_create(&S.thread, NULL, server_thread, NULL) != 0) {
+            E.thread_alive = 0;
+            S.started = 0;
+            close(fd);
+            S.server_fd = -1;
+            snprintf(msg, sizeof msg, "pthread_create failed");
+            goto fail;
+        }
+        LOGI("listening on %s, ASurfaceControl %s, mode %s", path,
+             api.ok ? "available" : "NOT available (Android 10+)",
+             E.force_egl ? "egl-forced" : "auto");
     }
     pthread_mutex_unlock(&S.lock);
     (*env)->ReleaseStringUTFChars(env, jpath, path);
@@ -655,6 +1182,23 @@ JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_IssPresent_nativeSetSurface(JNIE
         S.window = ANativeWindow_fromSurface(env, surface);
         make_surface_control();
     }
+    E.win_seq++;
+    if (E.thread_alive) {
+        wake_receiver();
+        if (!surface && E.has_surface) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 500000000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            while (E.has_surface && E.thread_alive && !E.shutdown) {
+                if (pthread_cond_timedwait(&E.win_cond, &S.lock, &ts) == ETIMEDOUT)
+                    break;
+            }
+        }
+    }
     pthread_mutex_unlock(&S.lock);
 }
 
@@ -665,16 +1209,30 @@ JNIEXPORT jlong JNICALL Java_ro_cobrabm_fexdroid_IssPresent_nativeFrames(JNIEnv*
 
 JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_IssPresent_nativeShutdown(JNIEnv* env, jclass cls) {
     (void)env; (void)cls;
+    pthread_t th = 0;
+    int join = 0;
+    int close_sfd = -1;
     pthread_mutex_lock(&S.lock);
     drop_surface_control();
     if (S.window) { ANativeWindow_release(S.window); S.window = NULL; }
+    E.win_seq++;
     if (S.started) {
-        shutdown(S.server_fd, SHUT_RDWR);
-        close(S.server_fd);
-        S.server_fd = -1;
+        if (S.server_fd >= 0) {
+            shutdown(S.server_fd, SHUT_RDWR);
+            close_sfd = S.server_fd;
+            S.server_fd = -1;
+        }
         unlink(S.path);
         if (S.conn_fd >= 0) shutdown(S.conn_fd, SHUT_RDWR);
         S.started = 0;
     }
+    if (E.thread_alive) {
+        E.shutdown = 1;
+        wake_receiver();
+        th = S.thread;
+        join = 1;
+    }
     pthread_mutex_unlock(&S.lock);
+    if (join) pthread_join(th, NULL);
+    if (close_sfd >= 0) close(close_sfd);
 }

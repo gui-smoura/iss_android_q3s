@@ -315,6 +315,10 @@ final class LanguageCatalogTrPl {
   {"Precompilation paused after repeated driver failures; shaders will compile in game.","Tekrarlanan sürücü hataları nedeniyle ön derleme duraklatıldı; gölgelendiriciler oyunda derlenecek.","Wstępna kompilacja wstrzymana po powtarzających się błędach sterownika; shadery zostaną skompilowane w grze."},
   {"Invalid shader job file (jobs.bin).","Geçersiz gölgelendirici görev dosyası (jobs.bin).","Nieprawidłowy plik zadań shaderów (jobs.bin)."},
   {"No cached shaders or jobs.bin found (0 on disk). Play once first or place CUSA00004-jobs.bin in Download or user/cache/.","Önbellekte gölgelendirici veya jobs.bin bulunamadı (diskte 0). Önce bir kez oynayın ya da CUSA00004-jobs.bin dosyasını Download veya user/cache/ içine koyun.","Nie znaleziono zapisanych shaderów ani pliku jobs.bin (0 na dysku). Zagraj najpierw raz lub umieść CUSA00004-jobs.bin w Download albo user/cache/."},
+  {"VR Mode / Virtual Screen (RAM Saver)","VR Modu / Sanal Ekran (RAM Tasarrufu)","Tryb VR / Wirtualny ekran (oszczędzanie RAM)"},
+  {"Starting OpenXR virtual screen…","OpenXR sanal ekranı başlatılıyor…","Uruchamianie wirtualnego ekranu OpenXR…"},
+  {"OpenXR virtual screen error","OpenXR sanal ekran hatası","Błąd wirtualnego ekranu OpenXR"},
+  {"Press Back again to exit VR mode.","VR modundan çıkmak için Geri düğmesine tekrar basın.","Naciśnij Wstecz ponownie, aby wyjść z trybu VR."},
   };
   for(String[] row:rows)TEXT.put(row[0],new String[]{row[1],row[2]});
  }

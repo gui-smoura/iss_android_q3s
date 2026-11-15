@@ -16,6 +16,7 @@ public final class IssPresent {
     private static native void nativeSetSurface(Surface surface);
     private static native long nativeFrames();
     private static native void nativeSetFullscreen(boolean enabled);
+    private static native void nativeSetForceEgl(boolean enabled);
     private static native void nativeSetFrameRate(float rate);
     public static void frameRate(float rate) { nativeSetFrameRate(rate); }
     private static native void nativeShutdown();
@@ -30,6 +31,7 @@ public final class IssPresent {
 
     public static synchronized String start(SurfaceHolder holder, String socketPath, boolean fullscreen) {
         nativeSetFullscreen(fullscreen);
+        nativeSetForceEgl(false);
         String result = nativeStart(socketPath);
         used = true;
         if (!result.equals("present running")) return result;
@@ -46,7 +48,23 @@ public final class IssPresent {
         return "bridge running: bionic present on " + socketPath;
     }
 
-    private static synchronized void setSurface(Surface surface) { nativeSetSurface(surface); }
+    /** Listens on socketPath and presents frames onto an OpenXR/external Android Surface via EGL. */
+    public static synchronized String start(Surface surface, String socketPath, boolean fullscreen) {
+        nativeSetFullscreen(fullscreen);
+        nativeSetForceEgl(true);
+        String result = nativeStart(socketPath);
+        used = true;
+        if (!result.equals("present running")) return result;
+        if (attached != null && callback != null) {
+            attached.removeCallback(callback);
+            attached = null;
+            callback = null;
+        }
+        setSurface(surface != null && surface.isValid() ? surface : null);
+        return "bridge running: bionic egl present on " + socketPath;
+    }
+
+    public static synchronized void setSurface(Surface surface) { nativeSetSurface(surface); }
 
     /** Frames the game has presented to the app so far. */
     public static long frames() { return nativeFrames(); }
@@ -56,5 +74,12 @@ public final class IssPresent {
     public static long framesIfLoaded() { return used ? nativeFrames() : 0; }
 
     /** Ends the listener and the display (the app is closing). */
-    public static synchronized void stop() { nativeShutdown(); }
+    public static synchronized void stop() {
+        if (attached != null && callback != null) {
+            attached.removeCallback(callback);
+            attached = null;
+            callback = null;
+        }
+        nativeShutdown();
+    }
 }

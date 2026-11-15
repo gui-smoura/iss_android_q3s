@@ -47,6 +47,7 @@ fetch ffmpeg-7.1.5 https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz
 fetch libucontext-49e671dd52ff6791295d8161ad3b6da7dc5f6f9d https://github.com/kaniini/libucontext/archive/49e671dd52ff6791295d8161ad3b6da7dc5f6f9d.tar.gz
 fetch SDL3-3.2.16 https://github.com/libsdl-org/SDL/archive/refs/tags/release-3.2.16.tar.gz
 fetch freetype-2.13.3 https://github.com/freetype/freetype/archive/refs/tags/VER-2-13-3.tar.gz
+fetch OpenXR-SDK-1.1.65 https://github.com/KhronosGroup/OpenXR-SDK/archive/refs/tags/release-1.1.65.tar.gz
 
 # Header-only: vulkan-hpp (the NDK ships Vulkan 1.3.275 C headers without it) and SPIR-V.
 cm vulkan-headers "$src/Vulkan-Headers-1.4.363"
@@ -66,6 +67,27 @@ cm freetype-2.13.3 "$src/freetype-2.13.3" -DBUILD_SHARED_LIBS=OFF \
     -DFT_DISABLE_BROTLI=ON -DFT_DISABLE_HARFBUZZ=ON
 cm SDL3-3.2.16 "$src/SDL3-3.2.16" -DSDL_SHARED=OFF -DSDL_STATIC=ON \
     -DSDL_TEST=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL=ON
+cm openxr-loader "$src/OpenXR-SDK-1.1.65" -DBUILD_LOADER=ON -DDYNAMIC_LOADER=ON \
+    -DBUILD_TESTS=OFF -DBUILD_API_LAYERS=OFF -DBUILD_CONFORMANCE_TESTS=OFF \
+    -DBUILD_WITH_SYSTEM_JSONCPP=OFF -DINSTALL_TO_ARCHITECTURE_PREFIXES=OFF
+mkdir -p "$prefix/lib" "$prefix/include/openxr" "$prefix/share/licenses/openxr"
+if [[ ! -s $prefix/lib/libopenxr_loader.so ]]; then
+    if [[ -s $prefix/jni/arm64-v8a/libopenxr_loader.so ]]; then
+        cp "$prefix/jni/arm64-v8a/libopenxr_loader.so" "$prefix/lib/libopenxr_loader.so"
+    elif [[ -s $bld/openxr-loader/src/loader/libopenxr_loader.so ]]; then
+        cp "$bld/openxr-loader/src/loader/libopenxr_loader.so" "$prefix/lib/libopenxr_loader.so"
+    fi
+fi
+if [[ ! -s $prefix/include/openxr/openxr.h ]]; then
+    cp -a "$src/OpenXR-SDK-1.1.65/include/openxr/." "$prefix/include/openxr/"
+fi
+if [[ -f $src/OpenXR-SDK-1.1.65/LICENSE ]]; then
+    cp "$src/OpenXR-SDK-1.1.65/LICENSE" "$prefix/share/licenses/openxr/LICENSE"
+elif [[ -f $src/OpenXR-SDK-1.1.65/LICENSES/Apache-2.0.txt ]]; then
+    cp "$src/OpenXR-SDK-1.1.65/LICENSES/Apache-2.0.txt" "$prefix/share/licenses/openxr/LICENSE"
+fi
+test -s "$prefix/lib/libopenxr_loader.so"
+test -s "$prefix/include/openxr/openxr.h"
 # Native ARM64 coroutine switching for preserved GR2-style HLE fibers. This
 # library uses a private freestanding context struct; no glibc symbols/ABI leak.
 if [[ ! -f $prefix/.done-libucontext ]]; then

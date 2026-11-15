@@ -3,8 +3,19 @@
 <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
 <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
 <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
+<uses-permission android:name="org.khronos.openxr.permission.OPENXR"/>
+<uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM"/>
 <uses-feature android:name="android.hardware.gamepad" android:required="false"/>
+<uses-feature android:name="android.hardware.vr.headtracking" android:required="false" android:version="1"/>
+<queries>
+<provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker"/>
+<intent><action android:name="org.khronos.openxr.OpenXRRuntimeService"/></intent>
+<intent><action android:name="org.khronos.openxr.OpenXRApiLayerService"/></intent>
+</queries>
 <application android:isGame="true" android:appCategory="game" android:debuggable="true" android:icon="@drawable/infamous" android:roundIcon="@drawable/infamous" android:label="inFAMOUS Second Son — Daedalus" android:theme="@style/InfamousTheme" android:allowBackup="false" android:extractNativeLibs="true" android:requestLegacyExternalStorage="true">
+<meta-data android:name="com.oculus.supportedDevices" android:value="quest|quest2|questpro|quest3|quest3s"/>
+<meta-data android:name="com.oculus.vr.focusaware" android:value="true"/>
 <activity android:name="ro.cobrabm.fexdroid.BionicMainActivity" android:configChanges="orientation|screenSize|keyboardHidden" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter></activity>
 <activity android:name="ro.cobrabm.fexdroid.BionicGameActivity" android:screenOrientation="sensorLandscape" android:configChanges="orientation|screenSize|keyboardHidden" android:exported="false"/>
+<activity android:name="ro.cobrabm.fexdroid.BionicVrGameActivity" android:launchMode="singleTask" android:screenOrientation="landscape" android:resizeableActivity="false" android:excludeFromRecents="true" android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode|density" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:exported="true"><intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="com.oculus.intent.category.VR"/><category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD"/></intent-filter></activity>
 </application></manifest>

@@ -47,3 +47,7 @@ No affiliation with or endorsement by Sony Interactive Entertainment.
 Native AudioOut PCM FIFO mixing adapted from Daedalus GoW3, source snapshot b3a7c3d,
 which credits Bloodborne-Android 2e472653. ISS AudioOut/Audio3d semantics retained.
 https://github.com/erickmendes22/gow3_android_daedalus_fork/blob/b3a7c3d/src/runtime_audio_bionic.c
+
+Khronos OpenXR SDK 1.1.65 (libopenxr_loader.so): Apache-2.0.
+https://github.com/KhronosGroup/OpenXR-SDK/releases/tag/release-1.1.65
+See openxr-LICENSE.txt in this directory.

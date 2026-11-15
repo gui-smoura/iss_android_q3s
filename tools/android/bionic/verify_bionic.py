@@ -16,7 +16,8 @@ def main():
         args.root / "bin/iss-probe", args.root / "bin/kgsl-chip-id",
         args.root / "bin/orbis-pkg-util", args.root / "lib/libbloodframe.so",
         args.root / "lib/libisscpu.so", args.root / "lib/libtlggpu.so",
-        args.root / "lib/libisspresent.so", args.root / "lib/libc++_shared.so",
+        args.root / "lib/libisspresent.so", args.root / "lib/libopenxr_loader.so",
+        args.root / "lib/libissopenxr.so", args.root / "lib/libc++_shared.so",
         args.root / "drivers/gen8/libvulkan_freedreno.so",
         args.root / "drivers/gen7/libvulkan_freedreno.so",
     ]

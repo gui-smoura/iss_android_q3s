@@ -9,6 +9,9 @@ jar="$sdk/platforms/android-35/android.jar"
 for t in aapt2 d8 zipalign apksigner; do test -x "$bt/$t"; done
 test -s "$jar"
 test -s out/bionic/lib/libisspresent.so
+test -s out/bionic/lib/libissopenxr.so
+test -s out/bionic/lib/libopenxr_loader.so
+test -s out/bionic/lib/libc++_shared.so
 python3 tools/android/bionic/package_runtime.py
 # Also validate the exact launcher bytes embedded in the runtime archive that
 # will be shipped inside the APK, not only the checked-in source.
@@ -25,6 +28,9 @@ test "${#classes[@]}" -gt 0
 cp out/release/iss-bionic-runtime.tar.gz "$work/package/assets/runtime.tar.gz"
 cp out/release/iss-bionic-runtime.sha256 "$work/package/assets/runtime.sha256"
 cp out/bionic/lib/libisspresent.so "$work/package/lib/arm64-v8a/libisspresent.so"
+cp out/bionic/lib/libissopenxr.so "$work/package/lib/arm64-v8a/libissopenxr.so"
+cp out/bionic/lib/libopenxr_loader.so "$work/package/lib/arm64-v8a/libopenxr_loader.so"
+cp out/bionic/lib/libc++_shared.so "$work/package/lib/arm64-v8a/libc++_shared.so"
 "$bt/aapt2" compile --dir android/app/res -o "$work/resources.zip"
 "$bt/aapt2" link -I "$jar" "$work/resources.zip" --manifest android/app/BionicAndroidManifest.xml \
   --min-sdk-version 30 --target-sdk-version 28 -o "$work/base.apk"
@@ -47,7 +53,7 @@ apk="$PWD/out/release/inFAMOUS-Second-Son-Daedalus-v${version}.apk"
   --ks-pass pass:android --key-pass pass:android --out "$apk" "$work/aligned.apk"
 "$bt/apksigner" verify --verbose "$apk"
 "$bt/aapt" dump badging "$apk" | grep -F "package: name='com.daedalus.iss.bionic'"
-for member in assets/runtime.tar.gz assets/runtime.sha256 lib/arm64-v8a/libisspresent.so classes.dex; do
+for member in assets/runtime.tar.gz assets/runtime.sha256 lib/arm64-v8a/libisspresent.so lib/arm64-v8a/libissopenxr.so lib/arm64-v8a/libopenxr_loader.so lib/arm64-v8a/libc++_shared.so classes.dex; do
   unzip -Z1 "$apk" | grep -qx "$member"
 done
 if [[ ${ISS_RELEASE_BUILD:-1} = 1 ]]; then
