@@ -867,11 +867,13 @@ static void egl_present_frame(const iss_present_msg* m, int acquire_fd) {
                 (unsigned long long)m->frame, (unsigned long long)(++S.txn_seq), m->generation, m->index,
                 (long long)trace_clock_ns(), m->width, m->height, vx, vy, vx + dw, vy + dh, w, h);
 
+    /* AHardwareBuffer has top-left origin while GL/EGL samples from bottom-left:
+     * map top NDC vertices (y = +1) to v = 1.0 and bottom (y = -1) to v = 0.0. */
     static const GLfloat kQuad[16] = {
-        -1.f,  1.f, 0.f, 0.f,
-         1.f,  1.f, 1.f, 0.f,
-        -1.f, -1.f, 0.f, 1.f,
-         1.f, -1.f, 1.f, 1.f,
+        -1.f,  1.f, 0.f, 1.f,
+         1.f,  1.f, 1.f, 1.f,
+        -1.f, -1.f, 0.f, 0.f,
+         1.f, -1.f, 1.f, 0.f,
     };
     glUseProgram(E.prog);
     glActiveTexture(GL_TEXTURE0);

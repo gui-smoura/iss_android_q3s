@@ -108,6 +108,38 @@ class BionicOpenXrTests(unittest.TestCase):
                     "eglDupNativeFenceFDANDROID", "E.win_cond", "E.force_egl"):
             self.assertIn(sym, present)
 
+        present_code = re.sub(r"/\*.*?\*/|//[^\n]*", "", present, flags=re.S)
+        vs_match = re.search(r'static const char\*\s+vs_src\s*=\s*((?:"[^"]*"\s*)+);', present_code, flags=re.S)
+        fs_match = re.search(r'static const char\*\s+fs_src\s*=\s*((?:"[^"]*"\s*)+);', present_code, flags=re.S)
+        self.assertIsNotNone(vs_match)
+        self.assertIsNotNone(fs_match)
+        self.assertIn("vUv = aUv;", vs_match.group(1))
+        self.assertIn("texture2D(uTex, vUv);", fs_match.group(1))
+        self.assertNotRegex(vs_match.group(1), r"1\.0?\s*-")
+        self.assertNotRegex(fs_match.group(1), r"1\.0?\s*-")
+
+        quad_match = re.search(
+            r'static const GLfloat kQuad\[16\]\s*=\s*\{(.*?)\};',
+            present_code,
+            flags=re.S,
+        )
+        self.assertIsNotNone(quad_match)
+        nums = [
+            float(tok.rstrip("fF"))
+            for tok in re.findall(r'[-+]?(?:\d+\.?\d*|\.\d+)f?', quad_match.group(1))
+        ]
+        self.assertEqual(len(nums), 16)
+        vertices = [tuple(nums[i:i + 4]) for i in range(0, 16, 4)]
+        self.assertEqual(
+            vertices,
+            [
+                (-1.0,  1.0, 0.0, 1.0),
+                ( 1.0,  1.0, 1.0, 1.0),
+                (-1.0, -1.0, 0.0, 0.0),
+                ( 1.0, -1.0, 1.0, 0.0),
+            ],
+        )
+
         present_java = (ROOT / "android/app/src/ro/cobrabm/fexdroid/IssPresent.java").read_text()
         self.assertIn("start(Surface surface, String socketPath, boolean fullscreen)", present_java)
         self.assertIn("nativeSetForceEgl(true)", present_java)
@@ -368,7 +400,9 @@ EGLint eglGetError(void);
 '''
         harness_c = r'''
 #include <assert.h>
+#include <sched.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <EGL/egl.h>
@@ -392,6 +426,7 @@ static int g_app_global_refs = 0;
 static int g_del_local_calls = 0;
 static int g_return_global_surf = 1;
 static jobject g_runtime_surf_ref = NULL;
+static atomic_int g_surface_fetched = 0;
 static const char* log_str = "/tmp/issopenxr_test.log";
 static int state_log[32];
 static int state_count = 0;
@@ -589,7 +624,7 @@ XrResult xrPollEvent(XrInstance i, XrEventDataBuffer* buf) {
         ch->state = seq[event_step++];
         return XR_SUCCESS;
     }
-    if (quad_frames >= 2 && event_step < 6) {
+    if (quad_frames >= 2 && atomic_load(&g_surface_fetched) && event_step < 6) {
         XrEventDataSessionStateChanged* ch = (XrEventDataSessionStateChanged*)buf;
         ch->type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED;
         ch->session = 33;
@@ -598,7 +633,13 @@ XrResult xrPollEvent(XrInstance i, XrEventDataBuffer* buf) {
     }
     return XR_EVENT_UNAVAILABLE;
 }
-XrResult xrWaitFrame(XrSession s, const XrFrameWaitInfo* wi, XrFrameState* fs) { (void)s; (void)wi; fs->predictedDisplayTime = 1000; fs->shouldRender = 1; return XR_SUCCESS; }
+XrResult xrWaitFrame(XrSession s, const XrFrameWaitInfo* wi, XrFrameState* fs) {
+    (void)s; (void)wi;
+    if (quad_frames >= 2 && !atomic_load(&g_surface_fetched)) sched_yield();
+    fs->predictedDisplayTime = 1000;
+    fs->shouldRender = 1;
+    return XR_SUCCESS;
+}
 XrResult xrBeginFrame(XrSession s, const XrFrameBeginInfo* bi) { (void)s; (void)bi; return XR_SUCCESS; }
 XrResult xrEndFrame(XrSession s, const XrFrameEndInfo* ei) {
     (void)s;
@@ -622,6 +663,7 @@ static void run_session_cycle(int return_global_surf) {
     g_del_local_calls = 0;
     g_return_global_surf = return_global_surf;
     g_runtime_surf_ref = NULL;
+    atomic_store(&g_surface_fetched, 0);
     state_count = 0;
     ended_after_stopping_idx = -1;
     quad_frames = 0;
@@ -635,7 +677,10 @@ static void run_session_cycle(int return_global_surf) {
     RefSlot* ss = find_ref(surf);
     assert(ss->kind == JNILocalRefType && ss->target == &dummy_surf);
     assert(g_del_local_calls == (return_global_surf ? 0 : 1));
-    while (Java_ro_cobrabm_fexdroid_IssOpenXr_nativeSessionState(&g_env, cls_ref) != XR_SESSION_STATE_EXITING) {}
+    atomic_store(&g_surface_fetched, 1);
+    while (Java_ro_cobrabm_fexdroid_IssOpenXr_nativeSessionState(&g_env, cls_ref) != XR_SESSION_STATE_EXITING) {
+        sched_yield();
+    }
     Java_ro_cobrabm_fexdroid_IssOpenXr_nativeStop(&g_env, cls_ref);
     assert(g_app_global_refs == 0);
     assert(Java_ro_cobrabm_fexdroid_IssOpenXr_nativeFrames(&g_env, cls_ref) >= 2);
