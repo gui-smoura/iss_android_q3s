@@ -75,6 +75,12 @@ class BionicOpenXrTests(unittest.TestCase):
         self.assertNotIn("xrEnumerateViewConfigurationViews", native_code)
         for zero_field in (".format = 0", ".sampleCount = 0", ".faceCount = 0", ".arraySize = 0", ".mipCount = 0"):
             self.assertIn(zero_field, native_code)
+        self.assertIn("GetObjectRefType", native_code)
+        self.assertIn("JNILocalRefType", native_code)
+        self.assertEqual(len(re.findall(r"->DeleteLocalRef\(", native_code)), 1)
+        for global_field in ("X.activity", "X.cls", "X.surface"):
+            self.assertNotRegex(native_code, rf"DeleteLocalRef\([^)]*\b{re.escape(global_field)}\b")
+            self.assertRegex(native_code, rf"DeleteGlobalRef\([^)]*\b{re.escape(global_field)}\b")
 
         java_xr = (ROOT / "android/app/src/ro/cobrabm/fexdroid/IssOpenXr.java").read_text()
         expected_states = {
@@ -286,6 +292,12 @@ typedef void* jobject;
 typedef jobject jclass;
 typedef jobject jstring;
 typedef void* jmethodID;
+typedef enum jobjectRefType {
+    JNIInvalidRefType = 0,
+    JNILocalRefType = 1,
+    JNIGlobalRefType = 2,
+    JNIWeakGlobalRefType = 3
+} jobjectRefType;
 #define JNIEXPORT
 #define JNICALL
 #define JNI_OK 0
@@ -304,6 +316,7 @@ struct JNINativeInterface_ {
     void (*DeleteGlobalRef)(JNIEnv*, jobject);
     jobject (*NewLocalRef)(JNIEnv*, jobject);
     void (*DeleteLocalRef)(JNIEnv*, jobject);
+    jobjectRefType (*GetObjectRefType)(JNIEnv*, jobject);
     jmethodID (*GetStaticMethodID)(JNIEnv*, jclass, const char*, const char*);
     void (*CallStaticVoidMethod)(JNIEnv*, jclass, jmethodID, ...);
     jboolean (*ExceptionCheck)(JNIEnv*);
@@ -363,9 +376,22 @@ EGLint eglGetError(void);
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+typedef struct {
+    void* target;
+    jobjectRefType kind;
+    int alive;
+    int runtime_owned;
+} RefSlot;
+
 static int dummy_obj = 1;
 static int dummy_surf = 2;
 static int dummy_cls = 3;
+static RefSlot g_refs[64];
+static int g_ref_count = 0;
+static int g_app_global_refs = 0;
+static int g_del_local_calls = 0;
+static int g_return_global_surf = 1;
+static jobject g_runtime_surf_ref = NULL;
 static const char* log_str = "/tmp/issopenxr_test.log";
 static int state_log[32];
 static int state_count = 0;
@@ -375,19 +401,79 @@ static int event_step = 0;
 
 void __android_log_print(int prio, const char* tag, const char* fmt, ...) { (void)prio; (void)tag; (void)fmt; }
 
+static RefSlot* alloc_ref(void* target, jobjectRefType kind, int runtime_owned) {
+    assert(target != NULL);
+    assert(g_ref_count < 64);
+    RefSlot* s = &g_refs[g_ref_count++];
+    s->target = target;
+    s->kind = kind;
+    s->alive = 1;
+    s->runtime_owned = runtime_owned;
+    if (kind == JNIGlobalRefType && !runtime_owned) g_app_global_refs++;
+    return s;
+}
+
+static RefSlot* find_ref(jobject o) {
+    for (int i = 0; i < g_ref_count; ++i) {
+        if ((jobject)&g_refs[i] == o) {
+            assert(g_refs[i].alive);
+            return &g_refs[i];
+        }
+    }
+    assert(0 && "Unknown or freed JNI reference passed to JNI");
+    return NULL;
+}
+
 static jint m_attach(JavaVM* vm, JNIEnv** env, void* args);
 static jint m_detach(JavaVM* vm) { (void)vm; return JNI_OK; }
 static struct JNIInvokeInterface_ g_vm_fn = { .AttachCurrentThread = m_attach, .DetachCurrentThread = m_detach };
 static JavaVM g_vm = &g_vm_fn;
 
 static jint m_get_vm(JNIEnv* e, JavaVM** out) { (void)e; *out = &g_vm; return JNI_OK; }
-static jobject m_new_global(JNIEnv* e, jobject o) { (void)e; return o; }
-static void m_del_global(JNIEnv* e, jobject o) { (void)e; (void)o; }
-static jobject m_new_local(JNIEnv* e, jobject o) { (void)e; return o; }
-static void m_del_local(JNIEnv* e, jobject o) { (void)e; (void)o; }
-static jmethodID m_get_mid(JNIEnv* e, jclass c, const char* n, const char* s) { (void)e; (void)c; (void)n; (void)s; return (jmethodID)&dummy_obj; }
+static jobject m_new_global(JNIEnv* e, jobject o) {
+    (void)e;
+    RefSlot* s = find_ref(o);
+    return (jobject)alloc_ref(s->target, JNIGlobalRefType, 0);
+}
+static void m_del_global(JNIEnv* e, jobject o) {
+    (void)e;
+    if (!o) return;
+    RefSlot* s = find_ref(o);
+    assert(s->kind == JNIGlobalRefType);
+    assert(!s->runtime_owned && "App must never DeleteGlobalRef runtime-owned surface ref");
+    s->alive = 0;
+    g_app_global_refs--;
+}
+static jobject m_new_local(JNIEnv* e, jobject o) {
+    (void)e;
+    RefSlot* s = find_ref(o);
+    return (jobject)alloc_ref(s->target, JNILocalRefType, 0);
+}
+static void m_del_local(JNIEnv* e, jobject o) {
+    (void)e;
+    if (!o) return;
+    RefSlot* s = find_ref(o);
+    /* Mirror ART CheckJNI: abort immediately if DeleteLocalRef receives a GlobalRef. */
+    assert(s->kind == JNILocalRefType && "CheckJNI: DeleteLocalRef called on non-Local ref");
+    s->alive = 0;
+    g_del_local_calls++;
+}
+static jobjectRefType m_get_ref_type(JNIEnv* e, jobject o) {
+    (void)e;
+    if (!o) return JNIInvalidRefType;
+    return find_ref(o)->kind;
+}
+static jmethodID m_get_mid(JNIEnv* e, jclass c, const char* n, const char* s) {
+    (void)e;
+    RefSlot* cs = find_ref((jobject)c);
+    assert(cs->kind == JNIGlobalRefType && cs->target == &dummy_cls);
+    (void)n; (void)s;
+    return (jmethodID)&dummy_obj;
+}
 static void m_call_static(JNIEnv* e, jclass c, jmethodID m, ...) {
-    (void)e; (void)c; (void)m;
+    (void)e; (void)m;
+    RefSlot* cs = find_ref((jobject)c);
+    assert(cs->kind == JNIGlobalRefType && cs->target == &dummy_cls);
     va_list ap; va_start(ap, m); int st = va_arg(ap, int); va_end(ap);
     if (state_count < 32) state_log[state_count++] = st;
 }
@@ -400,7 +486,8 @@ static jstring m_new_utf(JNIEnv* e, const char* s) { (void)e; return (jstring)st
 
 static struct JNINativeInterface_ g_env_fn = {
     .GetJavaVM = m_get_vm, .NewGlobalRef = m_new_global, .DeleteGlobalRef = m_del_global,
-    .NewLocalRef = m_new_local, .DeleteLocalRef = m_del_local, .GetStaticMethodID = m_get_mid,
+    .NewLocalRef = m_new_local, .DeleteLocalRef = m_del_local, .GetObjectRefType = m_get_ref_type,
+    .GetStaticMethodID = m_get_mid,
     .CallStaticVoidMethod = m_call_static, .ExceptionCheck = m_exc_check, .ExceptionDescribe = m_exc_desc,
     .ExceptionClear = m_exc_clear, .GetStringUTFChars = m_get_utf, .ReleaseStringUTFChars = m_rel_utf,
     .NewStringUTF = m_new_utf
@@ -419,7 +506,12 @@ EGLBoolean eglDestroyContext(EGLDisplay d, EGLContext c) { (void)d; (void)c; ret
 EGLBoolean eglTerminate(EGLDisplay d) { (void)d; return 1; }
 EGLint eglGetError(void) { return 0; }
 
-static XrResult mock_init_loader(const XrLoaderInitInfoBaseHeaderKHR* i) { (void)i; return XR_SUCCESS; }
+static XrResult mock_init_loader(const XrLoaderInitInfoBaseHeaderKHR* i) {
+    const XrLoaderInitInfoAndroidKHR* ai = (const XrLoaderInitInfoAndroidKHR*)i;
+    RefSlot* act = find_ref(ai->applicationContext);
+    assert(act->kind == JNIGlobalRefType && act->target == &dummy_obj);
+    return XR_SUCCESS;
+}
 static XrResult mock_get_gles_reqs(XrInstance i, XrSystemId s, XrGraphicsRequirementsOpenGLESKHR* r) {
     (void)i; (void)s; r->minApiVersionSupported = XR_MAKE_VERSION(3, 0, 0); r->maxApiVersionSupported = XR_MAKE_VERSION(3, 2, 0); return XR_SUCCESS;
 }
@@ -428,7 +520,12 @@ static XrResult mock_create_surf(XrSession s, const XrSwapchainCreateInfo* ci, X
     assert(ci->format == 0 && ci->sampleCount == 0 && ci->faceCount == 0 && ci->arraySize == 0 && ci->mipCount == 0);
     assert(ci->width == 1280 && ci->height == 720);
     *sc = 77;
-    *surf = &dummy_surf;
+    if (g_return_global_surf) {
+        g_runtime_surf_ref = (jobject)alloc_ref(&dummy_surf, JNIGlobalRefType, 1);
+    } else {
+        g_runtime_surf_ref = (jobject)alloc_ref(&dummy_surf, JNILocalRefType, 1);
+    }
+    *surf = g_runtime_surf_ref;
     return XR_SUCCESS;
 }
 XrResult xrGetInstanceProcAddr(XrInstance inst, const char* name, PFN_xrVoidFunction* fn) {
@@ -470,7 +567,15 @@ XrResult xrEndSession(XrSession s) {
 }
 XrResult xrCreateReferenceSpace(XrSession s, const XrReferenceSpaceCreateInfo* ci, XrSpace* sp) { (void)s; assert(ci->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL); *sp = 44; return XR_SUCCESS; }
 XrResult xrDestroySpace(XrSpace sp) { assert(sp == 44); return XR_SUCCESS; }
-XrResult xrDestroySwapchain(XrSwapchain sc) { assert(sc == 77); return XR_SUCCESS; }
+XrResult xrDestroySwapchain(XrSwapchain sc) {
+    assert(sc == 77);
+    if (g_return_global_surf && g_runtime_surf_ref) {
+        RefSlot* rs = find_ref(g_runtime_surf_ref);
+        assert(rs->kind == JNIGlobalRefType && rs->alive);
+        rs->alive = 0;
+    }
+    return XR_SUCCESS;
+}
 XrResult xrPollEvent(XrInstance i, XrEventDataBuffer* buf) {
     (void)i;
     static const XrSessionState seq[] = {
@@ -511,20 +616,41 @@ extern void Java_ro_cobrabm_fexdroid_IssOpenXr_nativeStop(JNIEnv* env, jclass cl
 extern jlong Java_ro_cobrabm_fexdroid_IssOpenXr_nativeFrames(JNIEnv* env, jclass cls);
 extern jint Java_ro_cobrabm_fexdroid_IssOpenXr_nativeSessionState(JNIEnv* env, jclass cls);
 
-int main(void) {
-    assert(JNI_OnLoad(&g_vm, NULL) == JNI_VERSION_1_6);
-    jstring res = Java_ro_cobrabm_fexdroid_IssOpenXr_nativeStart(&g_env, &dummy_cls, &dummy_obj, 1280, 720, (jstring)log_str);
+static void run_session_cycle(int return_global_surf) {
+    g_ref_count = 0;
+    g_app_global_refs = 0;
+    g_del_local_calls = 0;
+    g_return_global_surf = return_global_surf;
+    g_runtime_surf_ref = NULL;
+    state_count = 0;
+    ended_after_stopping_idx = -1;
+    quad_frames = 0;
+    event_step = 0;
+
+    jclass cls_ref = (jclass)alloc_ref(&dummy_cls, JNILocalRefType, 0);
+    jobject act_ref = (jobject)alloc_ref(&dummy_obj, JNILocalRefType, 0);
+    jstring res = Java_ro_cobrabm_fexdroid_IssOpenXr_nativeStart(&g_env, cls_ref, act_ref, 1280, 720, (jstring)log_str);
     assert(strcmp((const char*)res, "openxr running") == 0);
-    assert(Java_ro_cobrabm_fexdroid_IssOpenXr_nativeGetSurface(&g_env, &dummy_cls) == &dummy_surf);
-    while (Java_ro_cobrabm_fexdroid_IssOpenXr_nativeSessionState(&g_env, &dummy_cls) != XR_SESSION_STATE_EXITING) {}
-    Java_ro_cobrabm_fexdroid_IssOpenXr_nativeStop(&g_env, &dummy_cls);
-    assert(Java_ro_cobrabm_fexdroid_IssOpenXr_nativeFrames(&g_env, &dummy_cls) >= 2);
+    jobject surf = Java_ro_cobrabm_fexdroid_IssOpenXr_nativeGetSurface(&g_env, cls_ref);
+    RefSlot* ss = find_ref(surf);
+    assert(ss->kind == JNILocalRefType && ss->target == &dummy_surf);
+    assert(g_del_local_calls == (return_global_surf ? 0 : 1));
+    while (Java_ro_cobrabm_fexdroid_IssOpenXr_nativeSessionState(&g_env, cls_ref) != XR_SESSION_STATE_EXITING) {}
+    Java_ro_cobrabm_fexdroid_IssOpenXr_nativeStop(&g_env, cls_ref);
+    assert(g_app_global_refs == 0);
+    assert(Java_ro_cobrabm_fexdroid_IssOpenXr_nativeFrames(&g_env, cls_ref) >= 2);
     assert(ended_after_stopping_idx >= 5);
     assert(state_count == 6);
     assert(state_log[0] == XR_SESSION_STATE_READY);
     assert(state_log[3] == XR_SESSION_STATE_FOCUSED);
     assert(state_log[4] == XR_SESSION_STATE_STOPPING);
     assert(state_log[5] == XR_SESSION_STATE_EXITING);
+}
+
+int main(void) {
+    assert(JNI_OnLoad(&g_vm, NULL) == JNI_VERSION_1_6);
+    run_session_cycle(1); /* Meta Quest HorizonOS mode: swapchain returns GlobalRef */
+    run_session_cycle(0); /* LocalRef swapchain mode: freed safely via DeleteLocalRef */
     return 0;
 }
 '''

@@ -196,6 +196,16 @@ static void destroy_pbuffer_egl(XrEglCtx* g) {
     g->pbuf = EGL_NO_SURFACE;
 }
 
+/* HorizonOS/Oculus OpenXR returns a runtime-owned GlobalRef from
+ * xrCreateSwapchainAndroidSurfaceKHR, while other runtimes may return a LocalRef.
+ * Only call DeleteLocalRef when JNI reports JNILocalRefType. */
+static void release_if_local_ref(JNIEnv* jenv, jobject ref) {
+    if (!jenv || !ref) return;
+    if ((*jenv)->GetObjectRefType && (*jenv)->GetObjectRefType(jenv, ref) == JNILocalRefType) {
+        (*jenv)->DeleteLocalRef(jenv, ref);
+    }
+}
+
 static void* openxr_thread(void* unused) {
     (void)unused;
     JNIEnv* jenv = NULL;
@@ -205,7 +215,7 @@ static void* openxr_thread(void* unused) {
     XrSession session = XR_NULL_HANDLE;
     XrSpace local_space = XR_NULL_HANDLE;
     XrSwapchain swapchain = XR_NULL_HANDLE;
-    jobject local_surface = NULL;
+    jobject runtime_surface = NULL;
     int session_running = 0;
 
     pthread_mutex_lock(&X.lock);
@@ -439,14 +449,28 @@ static void* openxr_thread(void* unused) {
         .arraySize = 0,
         .mipCount = 0,
     };
-    res = pfnCreateAndroidSurface(session, &sc_ci, &swapchain, &local_surface);
-    if (XR_FAILED(res) || swapchain == XR_NULL_HANDLE || !local_surface) {
+    res = pfnCreateAndroidSurface(session, &sc_ci, &swapchain, &runtime_surface);
+    if (XR_FAILED(res) || swapchain == XR_NULL_HANDLE || !runtime_surface) {
+        if ((*jenv)->ExceptionCheck(jenv)) {
+            (*jenv)->ExceptionDescribe(jenv);
+            (*jenv)->ExceptionClear(jenv);
+        }
+        release_if_local_ref(jenv, runtime_surface);
+        runtime_surface = NULL;
+        if (swapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(swapchain);
+            swapchain = XR_NULL_HANDLE;
+        }
         sc_ci.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        swapchain = XR_NULL_HANDLE;
-        local_surface = NULL;
-        res = pfnCreateAndroidSurface(session, &sc_ci, &swapchain, &local_surface);
+        res = pfnCreateAndroidSurface(session, &sc_ci, &swapchain, &runtime_surface);
     }
-    if (XR_FAILED(res) || swapchain == XR_NULL_HANDLE || !local_surface) {
+    if (XR_FAILED(res) || swapchain == XR_NULL_HANDLE || !runtime_surface) {
+        if ((*jenv)->ExceptionCheck(jenv)) {
+            (*jenv)->ExceptionDescribe(jenv);
+            (*jenv)->ExceptionClear(jenv);
+        }
+        release_if_local_ref(jenv, runtime_surface);
+        runtime_surface = NULL;
         xr_log(1, "xrCreateSwapchainAndroidSurfaceKHR failed (%d)", (int)res);
         goto fail;
     }
@@ -455,9 +479,9 @@ static void* openxr_thread(void* unused) {
            quad_w, quad_h, has_fb_surf, (int)blend_mode);
 
     pthread_mutex_lock(&X.lock);
-    X.surface = (*jenv)->NewGlobalRef(jenv, local_surface);
-    (*jenv)->DeleteLocalRef(jenv, local_surface);
-    local_surface = NULL;
+    X.surface = (*jenv)->NewGlobalRef(jenv, runtime_surface);
+    release_if_local_ref(jenv, runtime_surface);
+    runtime_surface = NULL;
     if (!X.surface) {
         X.init_done = -1;
         snprintf(X.last_error, sizeof(X.last_error), "NewGlobalRef(Surface) failed");
@@ -620,9 +644,9 @@ cleanup:
         xrEndSession(session);
         session_running = 0;
     }
-    if (local_surface && jenv) {
-        (*jenv)->DeleteLocalRef(jenv, local_surface);
-        local_surface = NULL;
+    if (runtime_surface && jenv) {
+        release_if_local_ref(jenv, runtime_surface);
+        runtime_surface = NULL;
     }
     if (swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(swapchain);
